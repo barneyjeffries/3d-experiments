@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch *)",
+      "Bash(npm run build *)",
+      "Bash(npm run dev *)",
+      "Bash(curl -s http://localhost:*)",
+      "mcp__claude_ai_Slack__slack_search_public",
+      "mcp__claude_ai_Figma__get_metadata",
+      "mcp__claude_ai_Figma__get_design_context"
+    ]
+  }
+}
