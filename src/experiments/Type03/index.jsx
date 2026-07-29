@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { ContactShadows } from '@react-three/drei'
 import { Physics, RigidBody, CuboidCollider } from '@react-three/rapier'
-import { Euler, Quaternion } from 'three'
+import { Euler, Plane, Quaternion, Raycaster, Vector2, Vector3 } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
 import { useFont, useTextGeometries } from '../../shared/useTypographyGeometries'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
@@ -66,13 +66,24 @@ const SHADOW_ABOVE_FLOOR = 0.02
 // reads as too subtle.
 const POKE_IMPULSE_STRENGTH = 3
 
+// Click-and-throw — press on a letter (still pokes it immediately, same as
+// above), then if you drag before releasing, its on-screen drag velocity is
+// tracked and thrown as an impulse on release. A plain click with no drag
+// naturally computes a near-zero velocity, so it just reads as the poke above —
+// no separate "was this a drag" branch needed.
+const THROW_STRENGTH = 0.3 // impulse = tracked drag velocity * this
+const MAX_THROW_SPEED = 40 // world units/sec cap on the raw velocity sample, so a dropped frame can't produce one huge throw
+const DRAG_VELOCITY_SMOOTHING = 0.5 // 0..1, how much each new sample updates the tracked velocity
+
 function randRange(min, max) {
   return min + Math.random() * (max - min)
 }
 
 // Captures wheel/touch input and drives the floor's Y position — this is the only
 // consumer of scroll in this experiment, so the canvas itself never scrolls or zooms.
-function ScrollFloorControl({ floorYRef }) {
+// Skips touch-drag handling while a letter is being dragged (see DragThrowControl)
+// so a throw gesture on touch doesn't also drag the floor.
+function ScrollFloorControl({ floorYRef, activeDragRef }) {
   const { gl } = useThree()
 
   useEffect(() => {
@@ -93,7 +104,7 @@ function ScrollFloorControl({ floorYRef }) {
       lastTouchY = event.touches[0]?.clientY ?? null
     }
     const handleTouchMove = (event) => {
-      if (lastTouchY === null) return
+      if (lastTouchY === null || activeDragRef.current) return
       event.preventDefault()
       const y = event.touches[0]?.clientY ?? lastTouchY
       applyDelta((lastTouchY - y) * 2) // dragging up == scrolling down
@@ -109,6 +120,72 @@ function ScrollFloorControl({ floorYRef }) {
       el.removeEventListener('touchmove', handleTouchMove)
     }
   }, [gl, floorYRef])
+
+  return null
+}
+
+// Tracks a letter's drag-to-throw globally (one DOM listener, not one per letter)
+// so hover/move tracking doesn't need a full-scene raycast on every mouse move.
+// A letter's onPointerDown starts the drag by writing into activeDragRef; this
+// component only reads/updates it and applies the throw impulse on release.
+// The drag path is computed by intersecting the current pointer ray against a
+// plane fixed at the grab point, facing the camera — necessary because r3f's own
+// event.point does NOT update for a captured/dragged object as the pointer moves
+// off its original geometry, only a fresh event.ray does.
+function DragThrowControl({ activeDragRef, letterRefs }) {
+  const { gl, camera } = useThree()
+
+  useEffect(() => {
+    const el = gl.domElement
+    const raycaster = new Raycaster()
+    const pointer = new Vector2()
+    const point = new Vector3()
+
+    const updateRay = (event) => {
+      const rect = el.getBoundingClientRect()
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
+      raycaster.setFromCamera(pointer, camera)
+    }
+
+    const handlePointerMove = (event) => {
+      const drag = activeDragRef.current
+      if (!drag || event.pointerId !== drag.pointerId) return
+      updateRay(event)
+      if (!raycaster.ray.intersectPlane(drag.plane, point)) return
+      const now = performance.now()
+      const dt = Math.max((now - drag.lastTime) / 1000, 1 / 120)
+      const instant = point.clone().sub(drag.lastPoint).divideScalar(dt)
+      if (instant.length() > MAX_THROW_SPEED) instant.setLength(MAX_THROW_SPEED)
+      drag.velocity.lerp(instant, DRAG_VELOCITY_SMOOTHING)
+      drag.lastPoint.copy(point)
+      drag.lastTime = now
+    }
+
+    const releaseDrag = (event) => {
+      const drag = activeDragRef.current
+      if (!drag || event.pointerId !== drag.pointerId) return
+      const rigidBody = letterRefs.current[drag.letterIndex]
+      if (rigidBody) {
+        const v = drag.velocity
+        rigidBody.applyImpulseAtPoint(
+          { x: v.x * THROW_STRENGTH, y: v.y * THROW_STRENGTH, z: v.z * THROW_STRENGTH },
+          { x: drag.lastPoint.x, y: drag.lastPoint.y, z: drag.lastPoint.z },
+          true
+        )
+      }
+      activeDragRef.current = null
+    }
+
+    el.addEventListener('pointermove', handlePointerMove)
+    el.addEventListener('pointerup', releaseDrag)
+    el.addEventListener('pointercancel', releaseDrag)
+    return () => {
+      el.removeEventListener('pointermove', handlePointerMove)
+      el.removeEventListener('pointerup', releaseDrag)
+      el.removeEventListener('pointercancel', releaseDrag)
+    }
+  }, [gl, camera, activeDragRef, letterRefs])
 
   return null
 }
@@ -244,10 +321,12 @@ function FallingLetters() {
   const floorYRef = useRef(FLOOR_INITIAL_Y)
   const letterRefs = useRef([])
   const shadowRef = useRef(null)
+  const activeDragRef = useRef(null)
 
   return (
     <Physics gravity={[0, GRAVITY_Y, 0]}>
-      <ScrollFloorControl floorYRef={floorYRef} />
+      <ScrollFloorControl floorYRef={floorYRef} activeDragRef={activeDragRef} />
+      <DragThrowControl activeDragRef={activeDragRef} letterRefs={letterRefs} />
       <Floor floorYRef={floorYRef} />
       <Walls />
       <SceneController floorYRef={floorYRef} letterRefs={letterRefs} shadowRef={shadowRef} />
@@ -285,6 +364,19 @@ function FallingLetters() {
                 { x: event.point.x, y: event.point.y, z: event.point.z },
                 true
               )
+
+              // Start tracking a potential drag-to-throw on top of the poke above —
+              // DragThrowControl reads/updates this and applies the release impulse.
+              const normal = new Vector3()
+              event.camera.getWorldDirection(normal)
+              activeDragRef.current = {
+                pointerId: event.pointerId,
+                letterIndex: i,
+                plane: new Plane().setFromNormalAndCoplanarPoint(normal, event.point),
+                lastPoint: event.point.clone(),
+                lastTime: performance.now(),
+                velocity: new Vector3(),
+              }
             }}
           >
             <meshStandardMaterial color={letter.color} roughness={0.85} metalness={0} />
