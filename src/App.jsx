@@ -1,48 +1,26 @@
-import { Suspense } from 'react'
-import { Canvas } from '@react-three/fiber'
-import { OrbitControls } from '@react-three/drei'
-import TypographyScatter from './TypographyScatter'
-import ErrorBoundary from './ErrorBoundary'
-
-function SceneErrorNotice(error) {
-  return (
-    <div
-      style={{
-        width: '100vw',
-        height: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontFamily: 'system-ui, sans-serif',
-        color: '#333',
-        background: '#f5f5f5',
-        textAlign: 'center',
-        padding: '2rem',
-      }}
-    >
-      <div>
-        Something went wrong loading the scene.
-        <pre style={{ marginTop: '1rem', textAlign: 'left', whiteSpace: 'pre-wrap' }}>
-          {error?.stack || error?.message || String(error)}
-        </pre>
-      </div>
-    </div>
-  )
-}
+// HashRouter, not BrowserRouter: this app deploys to a GitHub Pages subpath
+// (see vite.config.js `base`) as a static site with no server-side rewrites.
+// A direct load or refresh on a nested route like /type-01 would 404 with
+// history-based routing, since Pages has no route it can fall back from.
+// Hash routing keeps every real request at "/" and does the routing client-side.
+import { HashRouter, Routes, Route } from 'react-router-dom'
+import Nav from './shared/Nav'
+import Home from './pages/Home'
+import Type01 from './experiments/Type01'
+import Type02 from './experiments/Type02'
+import Type03 from './experiments/Type03'
 
 function App() {
   return (
-    <ErrorBoundary fallback={SceneErrorNotice}>
-      <Canvas style={{ width: '100vw', height: '100vh' }} camera={{ position: [10, 8, 10], fov: 50 }}>
-        <color attach="background" args={['#f5f5f5']} />
-        <ambientLight intensity={0.9} />
-        <directionalLight position={[5, 10, 5]} intensity={0.5} />
-        <Suspense fallback={null}>
-          <TypographyScatter />
-        </Suspense>
-        <OrbitControls />
-      </Canvas>
-    </ErrorBoundary>
+    <HashRouter>
+      <Nav />
+      <Routes>
+        <Route path="/" element={<Home />} />
+        <Route path="/type-01" element={<Type01 />} />
+        <Route path="/type-02" element={<Type02 />} />
+        <Route path="/type-03" element={<Type03 />} />
+      </Routes>
+    </HashRouter>
   )
 }
 
