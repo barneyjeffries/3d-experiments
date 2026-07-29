@@ -61,6 +61,11 @@ const RESPAWN_HEIGHT_ABOVE_CAMERA_RANGE = [7, 14]
 // Contact shadow — soft grounding cue since the floor mesh itself is invisible.
 const SHADOW_ABOVE_FLOOR = 0.02
 
+// Click/tap "poke" — a light prod, not a launch. Letter hull masses are tiny
+// (thin extruded glyphs), so this impulse is small on purpose; scale it up if it
+// reads as too subtle.
+const POKE_IMPULSE_STRENGTH = 3
+
 function randRange(min, max) {
   return min + Math.random() * (max - min)
 }
@@ -260,7 +265,28 @@ function FallingLetters() {
         >
           {/* Convex hull is an approximation — letterforms are concave, but a hull
               is cheap and stable and fills the concavities. Good enough for this pass. */}
-          <mesh geometry={geometries[letter.char]} scale={letter.scale}>
+          <mesh
+            geometry={geometries[letter.char]}
+            scale={letter.scale}
+            onPointerDown={(event) => {
+              // Deliberately onPointerDown, not onClick: r3f's onClick only fires
+              // if the object hit at pointerdown still matches the object hit when
+              // the click resolves (its "click-through-drag" guard). These letters
+              // are always moving at least a little — falling, tumbling, settling —
+              // so that match very often fails and onClick silently never fires.
+              // onPointerDown raycasts fresh on press with no such gate, and reads
+              // as a more natural "poke" (immediate on press) besides.
+              event.stopPropagation()
+              const rigidBody = letterRefs.current[i]
+              if (!rigidBody) return
+              const dir = event.ray.direction
+              rigidBody.applyImpulseAtPoint(
+                { x: dir.x * POKE_IMPULSE_STRENGTH, y: dir.y * POKE_IMPULSE_STRENGTH, z: dir.z * POKE_IMPULSE_STRENGTH },
+                { x: event.point.x, y: event.point.y, z: event.point.z },
+                true
+              )
+            }}
+          >
             <meshStandardMaterial color={letter.color} roughness={0.85} metalness={0} />
           </mesh>
         </RigidBody>
