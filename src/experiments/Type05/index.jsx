@@ -2,10 +2,16 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { ContactShadows } from '@react-three/drei'
 import { Physics, RigidBody, CuboidCollider } from '@react-three/rapier'
-import { Euler, Plane, Quaternion, Raycaster, Vector2, Vector3 } from 'three'
+import { RigidBodyType } from '@dimforge/rapier3d-compat'
+import { Object3D, Plane, Quaternion, Raycaster, Vector2, Vector3 } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
 import { useFont, useTextGeometries } from '../../shared/useTypographyGeometries'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
+
+// Anagrams of "everything moves" — fixed sequence, hardcoded (not generated).
+// Every letter each of these needs already exists somewhere in the pile below,
+// since the pile is built from that same phrase's unique-character alphabet.
+const WORDS = ['MOVES', 'SHIVER', 'GROVES', 'NERVES']
 
 const PHRASE = 'everything moves'
 const LETTER_COUNT_RANGE = [150, 250]
@@ -26,20 +32,16 @@ const SPAWN_MAX_Y = 10
 // Play area — walls keep letters from bouncing out of frame sideways.
 const WALL_HALF_WIDTH = 5.5
 const WALL_HALF_DEPTH = 5.5
-const WALL_HALF_HEIGHT = 100 // generously tall, since the floor can drop a long way
+const WALL_HALF_HEIGHT = 20
 const WALL_THICKNESS = 0.5
 
-// Floor — scroll-controlled, provisional tuning.
+// Floor — fixed. Unlike type-03, scroll no longer drops it; scroll now drives
+// the word-assembly cycle instead, so the pile just settles here once and stays.
 const FLOOR_HALF_THICKNESS = 0.25
-const FLOOR_INITIAL_Y = -4
-const FLOOR_MAX_Y = FLOOR_INITIAL_Y // can't be scrolled back up higher than the start
-const FLOOR_MIN_Y = -60 // effectively bottomless for a normal scroll session
-const SCROLL_TO_FLOOR = 0.015 // wheel deltaY units -> world Y units
-const MAX_WHEEL_DELTA = 120 // clamps a single fast fling so the floor can't teleport
+const FLOOR_Y = -4
+const SHADOW_ABOVE_FLOOR = 0.02
 
-// Physics feel — exaggerated gravity for a lively (not sluggish) re-fall. Bouncy
-// on purpose, including accepting that the floor can launch letters upward if it
-// rises into them fast — that liveliness is the point of this pass.
+// Physics feel — same lively, bouncy tuning as type-03.
 const GRAVITY_Y = -30
 const RESTITUTION = 0.35
 const FRICTION = 0.6
@@ -47,43 +49,82 @@ const LINEAR_DAMPING = 0.5
 const ANGULAR_DAMPING = 0.6
 const FLOOR_RESTITUTION = 0.1
 
-// Camera follow — eases down with the floor rather than snapping, keeping the
-// same relative height above it so the landing zone stays framed.
-const CAMERA_HEIGHT_ABOVE_FLOOR = 8 - FLOOR_INITIAL_Y // matches SceneCanvas's default camera Y (8)
-const CAMERA_FOLLOW_LERP = 0.06
-const LOOK_AT_ABOVE_FLOOR = 1 // look slightly above the floor plane, where letters pile
-
-// Recycling — letters left far above the current camera (out of view) are
-// teleported back to just above it, so the fall keeps feeding the frame as we descend.
-const RECYCLE_ABOVE_CAMERA_MARGIN = 6
-const RESPAWN_HEIGHT_ABOVE_CAMERA_RANGE = [7, 14]
-
-// Contact shadow — soft grounding cue since the floor mesh itself is invisible.
-const SHADOW_ABOVE_FLOOR = 0.02
-
-// Click/tap "poke" — a light prod, not a launch. Letter hull masses are tiny
-// (thin extruded glyphs), so this impulse is small on purpose; scale it up if it
-// reads as too subtle.
+// Click/tap poke + drag-throw — identical feel to type-03. Ignored on a letter
+// currently claimed by the word-builder (rising, held, or still kinematic).
 const POKE_IMPULSE_STRENGTH = 3
+const THROW_STRENGTH = 0.3
+const MAX_THROW_SPEED = 40
+const DRAG_VELOCITY_SMOOTHING = 0.5
 
-// Click-and-throw — press on a letter (still pokes it immediately, same as
-// above), then if you drag before releasing, its on-screen drag velocity is
-// tracked and thrown as an impulse on release. A plain click with no drag
-// naturally computes a near-zero velocity, so it just reads as the poke above —
-// no separate "was this a drag" branch needed.
-const THROW_STRENGTH = 0.3 // impulse = tracked drag velocity * this
-const MAX_THROW_SPEED = 40 // world units/sec cap on the raw velocity sample, so a dropped frame can't produce one huge throw
-const DRAG_VELOCITY_SMOOTHING = 0.5 // 0..1, how much each new sample updates the tracked velocity
+// Scroll -> word-cycle timeline. Raw wheel/touch input accumulates into a 0..1
+// target, which the frame loop damps toward — same shape as type-04's timeline.
+const TOTAL_SCROLL_DISTANCE = 8000
+const MAX_WHEEL_DELTA = 120
+const PROGRESS_SMOOTHING = 0.1
+// Below this, treat the timeline as "untouched" so the pile can settle on load
+// without any letters being snatched into kinematic mode before the user scrolls.
+const MIN_PROGRESS_TO_BUILD = 1e-4
+
+// Each word owns an equal slice of the timeline. RISE_SPAN is how much of that
+// slice (in local-t units) the rise-into-formation animation spans, measured
+// from wherever the letter was captured — not from a fixed start — so a
+// reversal mid-fall re-uses the exact same curve from whatever point it's at.
+const RISE_SPAN = 0.28
+const RELEASE_AT = 0.7 // local-t threshold: below = held kinematic, at/above = released to physics
+const STAGGER = 0.4 // per-letter spread of rise start, for a non-lockstep cascade
+
+// Formation — centred, facing the camera, rising clear of the pile.
+const ASSEMBLE_HEIGHT_ABOVE_FLOOR = 7
+const LETTER_ROW_GAP = 0.14
+const WOBBLE_AMPLITUDE = 0.03
+const WOBBLE_SPEED_RANGE = [0.3, 0.7]
+
+// A tiny release kick so a dropped letter doesn't just go inert — a light
+// natural tumble as gravity retakes it, not a launch.
+const RELEASE_LINVEL_RANGE = [-0.4, 0.4]
+const RELEASE_ANGVEL_RANGE = [-1, 1]
+
+const TAU = Math.PI * 2
 
 function randRange(min, max) {
   return min + Math.random() * (max - min)
 }
 
-// Captures wheel/touch input and drives the floor's Y position — this is the only
-// consumer of scroll in this experiment, so the canvas itself never scrolls or zooms.
-// Skips touch-drag handling while a letter is being dragged (see DragThrowControl)
-// so a throw gesture on touch doesn't also drag the floor.
-function ScrollFloorControl({ floorYRef, activeDragRef }) {
+function lerp(a, b, t) {
+  return a + (b - a) * t
+}
+
+function clamp01(v) {
+  return Math.min(1, Math.max(0, v))
+}
+
+function easeOutCubic(t) {
+  const inv = 1 - t
+  return 1 - inv * inv * inv
+}
+
+// Centers a word's letters in a row, spaced by each glyph's actual bounding-box
+// width (post-`.center()`, so TextGeometry has already computed it).
+function layoutWord(word, geometries, gap) {
+  const letters = word.split('')
+  const widths = letters.map((ch) => {
+    const box = geometries[ch].boundingBox
+    return box.max.x - box.min.x
+  })
+  const totalWidth = widths.reduce((sum, w) => sum + w, 0) + gap * (letters.length - 1)
+  let cursor = -totalWidth / 2
+  const offsets = []
+  for (let i = 0; i < letters.length; i++) {
+    offsets.push(cursor + widths[i] / 2)
+    cursor += widths[i] + gap
+  }
+  return { letters, offsets }
+}
+
+// Captures wheel/touch input and accumulates a 0..1 scroll target for the
+// word-cycle timeline — the only consumer of scroll here, so the page itself
+// never scrolls.
+function WordCycleScrollControl({ progressTargetRef }) {
   const { gl } = useThree()
 
   useEffect(() => {
@@ -91,7 +132,7 @@ function ScrollFloorControl({ floorYRef, activeDragRef }) {
 
     const applyDelta = (rawDelta) => {
       const delta = Math.max(-MAX_WHEEL_DELTA, Math.min(MAX_WHEEL_DELTA, rawDelta))
-      floorYRef.current = Math.min(FLOOR_MAX_Y, Math.max(FLOOR_MIN_Y, floorYRef.current - delta * SCROLL_TO_FLOOR))
+      progressTargetRef.current = clamp01(progressTargetRef.current + delta / TOTAL_SCROLL_DISTANCE)
     }
 
     const handleWheel = (event) => {
@@ -104,10 +145,10 @@ function ScrollFloorControl({ floorYRef, activeDragRef }) {
       lastTouchY = event.touches[0]?.clientY ?? null
     }
     const handleTouchMove = (event) => {
-      if (lastTouchY === null || activeDragRef.current) return
+      if (lastTouchY === null) return
       event.preventDefault()
       const y = event.touches[0]?.clientY ?? lastTouchY
-      applyDelta((lastTouchY - y) * 2) // dragging up == scrolling down
+      applyDelta((lastTouchY - y) * 2)
       lastTouchY = y
     }
 
@@ -119,19 +160,24 @@ function ScrollFloorControl({ floorYRef, activeDragRef }) {
       el.removeEventListener('touchstart', handleTouchStart)
       el.removeEventListener('touchmove', handleTouchMove)
     }
-  }, [gl, floorYRef])
+  }, [gl, progressTargetRef])
 
   return null
 }
 
-// Tracks a letter's drag-to-throw globally (one DOM listener, not one per letter)
-// so hover/move tracking doesn't need a full-scene raycast on every mouse move.
-// A letter's onPointerDown starts the drag by writing into activeDragRef; this
-// component only reads/updates it and applies the throw impulse on release.
-// The drag path is computed by intersecting the current pointer ray against a
-// plane fixed at the grab point, facing the camera — necessary because r3f's own
-// event.point does NOT update for a captured/dragged object as the pointer moves
-// off its original geometry, only a fresh event.ray does.
+// Camera is static in this scene (the floor no longer drops), but it still
+// needs to actually aim at the pile — R3F just places the camera, it doesn't
+// point it anywhere on its own.
+function CameraAim({ target }) {
+  const { camera } = useThree()
+  useFrame(() => {
+    camera.lookAt(target[0], target[1], target[2])
+  })
+  return null
+}
+
+// Tracks a letter's drag-to-throw globally (one DOM listener, not one per
+// letter). Identical to type-03's version.
 function DragThrowControl({ activeDragRef, letterRefs }) {
   const { gl, camera } = useThree()
 
@@ -190,29 +236,8 @@ function DragThrowControl({ activeDragRef, letterRefs }) {
   return null
 }
 
-// Kinematic floor: its Y is driven by scroll each frame via setNextKinematicTranslation,
-// unthrottled in both directions. When it drops below letters that had settled on
-// it, they simply lose their support and fall again — Rapier handles that
-// naturally, no extra "release" logic needed. Moving up into resting letters can
-// launch them — that's an accepted quirk here in favor of keeping the motion lively.
-// No visible mesh here — a ContactShadows plane (see SceneController) reads as the
-// ground instead, so grounding stays soft rather than a hard-edged box.
-function Floor({ floorYRef }) {
-  const rigidRef = useRef(null)
-
-  useFrame(() => {
-    rigidRef.current?.setNextKinematicTranslation({ x: 0, y: floorYRef.current, z: 0 })
-  })
-
-  return (
-    <RigidBody ref={rigidRef} type="kinematicPosition" colliders={false} restitution={FLOOR_RESTITUTION} friction={0.9}>
-      <CuboidCollider args={[WALL_HALF_WIDTH, FLOOR_HALF_THICKNESS, WALL_HALF_DEPTH]} />
-    </RigidBody>
-  )
-}
-
 // Invisible static walls on all four sides so letters bounce/pile within frame
-// instead of escaping sideways. Tall enough to stay valid however low the floor gets.
+// instead of escaping sideways.
 function Walls() {
   const sideOffset = WALL_HALF_WIDTH + WALL_THICKNESS / 2
   const depthOffset = WALL_HALF_DEPTH + WALL_THICKNESS / 2
@@ -234,60 +259,6 @@ function Walls() {
   )
 }
 
-// Owns everything that needs to react to the floor's Y each frame but isn't the
-// floor's own physics body: the camera (position + lookAt, eased rather than
-// snapped), the contact shadow plane, and recycling letters that end up stranded
-// above the current view back into the fall.
-function SceneController({ floorYRef, letterRefs, shadowRef }) {
-  const { camera } = useThree()
-  const cameraYRef = useRef(camera.position.y)
-
-  useFrame(() => {
-    const targetCameraY = floorYRef.current + CAMERA_HEIGHT_ABOVE_FLOOR
-    cameraYRef.current += (targetCameraY - cameraYRef.current) * CAMERA_FOLLOW_LERP
-    camera.position.y = cameraYRef.current
-    camera.lookAt(0, cameraYRef.current - CAMERA_HEIGHT_ABOVE_FLOOR + LOOK_AT_ABOVE_FLOOR, 0)
-
-    if (shadowRef.current) {
-      shadowRef.current.position.y = floorYRef.current + SHADOW_ABOVE_FLOOR
-    }
-
-    const recycleAboveY = cameraYRef.current + RECYCLE_ABOVE_CAMERA_MARGIN
-    for (const rigidBody of letterRefs.current) {
-      if (!rigidBody) continue
-      if (rigidBody.translation().y <= recycleAboveY) continue
-
-      rigidBody.setTranslation(
-        {
-          x: randRange(-SPAWN_HALF_WIDTH, SPAWN_HALF_WIDTH),
-          y: cameraYRef.current + randRange(...RESPAWN_HEIGHT_ABOVE_CAMERA_RANGE),
-          z: randRange(-SPAWN_HALF_DEPTH, SPAWN_HALF_DEPTH),
-        },
-        true
-      )
-      rigidBody.setLinvel({ x: 0, y: 0, z: 0 }, true)
-      rigidBody.setAngvel({ x: 0, y: 0, z: 0 }, true)
-      const q = new Quaternion().setFromEuler(
-        new Euler(randRange(0, Math.PI * 2), randRange(0, Math.PI * 2), randRange(0, Math.PI * 2))
-      )
-      rigidBody.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true)
-    }
-  })
-
-  return (
-    <ContactShadows
-      ref={shadowRef}
-      position={[0, FLOOR_INITIAL_Y + SHADOW_ABOVE_FLOOR, 0]}
-      scale={WALL_HALF_WIDTH * 2.2}
-      opacity={0.35}
-      blur={2.8}
-      far={6}
-      resolution={512}
-      color="#000000"
-    />
-  )
-}
-
 function FallingLetters() {
   const font = useFont(fontUrl)
   const chars = useMemo(() => [...new Set(PHRASE.replace(/\s/g, '').split(''))], [])
@@ -298,6 +269,9 @@ function FallingLetters() {
     bevelSize: BEVEL_SIZE,
   })
 
+  // The pile itself — untouched from type-03. It's already "the letters of
+  // everything moves" (each drawn from that phrase's unique-character
+  // alphabet), so the word-builder below only ever selects from what's here.
   const letters = useMemo(() => {
     const count = Math.round(randRange(...LETTER_COUNT_RANGE))
     const list = []
@@ -318,18 +292,171 @@ function FallingLetters() {
     return list
   }, [chars])
 
-  const floorYRef = useRef(FLOOR_INITIAL_Y)
   const letterRefs = useRef([])
-  const shadowRef = useRef(null)
   const activeDragRef = useRef(null)
+
+  const progressTargetRef = useRef(0) // raw, instantly updated from scroll input
+  const progressRef = useRef(0) // damped display value that actually drives the build
+
+  // The word currently under construction: which word index owns the active
+  // scroll segment, and the selected pile letters assembling/holding/falling
+  // for it. Cleared and reselected whenever the active word index changes.
+  const buildRef = useRef({ wordIndex: -1, items: [] })
+
+  const cameraTmp = useMemo(() => new Object3D(), [])
+  const dummyQuat = useMemo(() => new Quaternion(), [])
+
+  // Grabs available pile letters spelling `word`, laid out in a row facing the
+  // camera. Only called once per word transition — reversal within the same
+  // word re-poses the already-selected letters, it doesn't reselect them.
+  function selectWordLetters(wordIndex, camera) {
+    const word = WORDS[wordIndex].toLowerCase()
+    const { letters: wordChars, offsets } = layoutWord(word, geometries, LETTER_ROW_GAP)
+
+    const formationCenter = new Vector3(0, FLOOR_Y + ASSEMBLE_HEIGHT_ABOVE_FLOOR, 0)
+    // Pure-yaw facing: project the camera onto the formation's own horizontal
+    // plane before aiming, so letters stand upright with no pitch/roll — just
+    // rotated to face the camera's direction. lookAt points -Z at the target,
+    // so the extra rotateY(PI) flips it to +Z (this geometry's front) instead.
+    const lookTarget = camera.position.clone()
+    lookTarget.y = formationCenter.y
+    cameraTmp.position.copy(formationCenter)
+    cameraTmp.lookAt(lookTarget)
+    cameraTmp.rotateY(Math.PI)
+    const facingQuat = cameraTmp.quaternion.clone()
+    const rightVector = new Vector3(1, 0, 0).applyQuaternion(facingQuat)
+
+    const usedThisWord = new Set()
+    const items = []
+    for (let k = 0; k < wordChars.length; k++) {
+      const char = wordChars[k]
+      let letterIndex = -1
+      for (let i = 0; i < letters.length; i++) {
+        if (letters[i].char === char && !usedThisWord.has(i)) {
+          letterIndex = i
+          break
+        }
+      }
+      if (letterIndex === -1) continue // pile happened to run out of this char — skip gracefully
+      usedThisWord.add(letterIndex)
+
+      items.push({
+        letterIndex,
+        targetPos: formationCenter.clone().addScaledVector(rightVector, offsets[k]),
+        targetQuat: facingQuat.clone(),
+        capturePos: new Vector3(),
+        captureQuat: new Quaternion(),
+        captureLocalT: 0,
+        mode: 'dynamic', // not yet captured — the per-frame loop below captures it on first pass
+        entryStagger: Math.random(),
+        wobblePhase: randRange(0, TAU),
+        wobbleSpeed: randRange(...WOBBLE_SPEED_RANGE),
+      })
+    }
+    return items
+  }
+
+  function releaseItem(item) {
+    if (item.mode !== 'kinematic') return
+    const mesh = letterRefs.current[item.letterIndex]
+    if (mesh) {
+      mesh.setBodyType(RigidBodyType.Dynamic, true)
+      mesh.setLinvel({ x: randRange(...RELEASE_LINVEL_RANGE), y: 0, z: randRange(...RELEASE_LINVEL_RANGE) }, true)
+      mesh.setAngvel(
+        { x: randRange(...RELEASE_ANGVEL_RANGE), y: randRange(...RELEASE_ANGVEL_RANGE), z: randRange(...RELEASE_ANGVEL_RANGE) },
+        true
+      )
+    }
+    item.mode = 'dynamic'
+  }
+
+  useFrame((state) => {
+    progressRef.current += (progressTargetRef.current - progressRef.current) * PROGRESS_SMOOTHING
+    const progress = progressRef.current
+    const build = buildRef.current
+
+    if (progress < MIN_PROGRESS_TO_BUILD) {
+      // Untouched: let the pile settle with nothing captured, and forget any
+      // previous selection so scrolling back down starts a clean rise.
+      for (const item of build.items) releaseItem(item)
+      build.wordIndex = -1
+      build.items = []
+      return
+    }
+
+    const wordCount = WORDS.length
+    const segmentLength = 1 / wordCount
+    const activeWordIndex = Math.min(wordCount - 1, Math.floor(progress * wordCount))
+    const segStart = activeWordIndex * segmentLength
+    const localT = clamp01((progress - segStart) / segmentLength)
+
+    if (build.wordIndex !== activeWordIndex) {
+      for (const item of build.items) releaseItem(item)
+      build.wordIndex = activeWordIndex
+      build.items = selectWordLetters(activeWordIndex, state.camera)
+    }
+
+    const t = state.clock.elapsedTime
+    const desiredKinematic = localT < RELEASE_AT
+
+    for (const item of build.items) {
+      const mesh = letterRefs.current[item.letterIndex]
+      if (!mesh) continue
+
+      if (desiredKinematic && item.mode !== 'kinematic') {
+        // Capture wherever the letter currently is — whether resting in the
+        // pile (fresh word) or mid-fall (a reversal catching it) — and start
+        // the rise from exactly that pose. No pop either way.
+        const p = mesh.translation()
+        const r = mesh.rotation()
+        item.capturePos.set(p.x, p.y, p.z)
+        item.captureQuat.set(r.x, r.y, r.z, r.w)
+        item.captureLocalT = localT
+        item.mode = 'kinematic'
+        mesh.setLinvel({ x: 0, y: 0, z: 0 }, true)
+        mesh.setAngvel({ x: 0, y: 0, z: 0 }, true)
+        mesh.setBodyType(RigidBodyType.KinematicPositionBased, true)
+      } else if (!desiredKinematic && item.mode === 'kinematic') {
+        releaseItem(item)
+      }
+
+      if (item.mode === 'kinematic') {
+        const span = Math.abs(localT - item.captureLocalT)
+        const raw = clamp01(span / RISE_SPAN)
+        const staggered = clamp01((raw - item.entryStagger * STAGGER) / (1 - STAGGER))
+        const eased = easeOutCubic(staggered)
+        const wobble = Math.sin(t * item.wobbleSpeed + item.wobblePhase) * WOBBLE_AMPLITUDE * eased
+
+        dummyQuat.copy(item.captureQuat).slerp(item.targetQuat, eased)
+        mesh.setNextKinematicTranslation({
+          x: lerp(item.capturePos.x, item.targetPos.x, eased),
+          y: lerp(item.capturePos.y, item.targetPos.y, eased) + wobble,
+          z: lerp(item.capturePos.z, item.targetPos.z, eased),
+        })
+        mesh.setNextKinematicRotation({ x: dummyQuat.x, y: dummyQuat.y, z: dummyQuat.z, w: dummyQuat.w })
+      }
+      // else: released — physics owns it entirely, no scripted control.
+    }
+  })
 
   return (
     <Physics gravity={[0, GRAVITY_Y, 0]}>
-      <ScrollFloorControl floorYRef={floorYRef} activeDragRef={activeDragRef} />
+      <WordCycleScrollControl progressTargetRef={progressTargetRef} />
       <DragThrowControl activeDragRef={activeDragRef} letterRefs={letterRefs} />
-      <Floor floorYRef={floorYRef} />
+      <CameraAim target={[0, FLOOR_Y + 1, 0]} />
+      <RigidBody type="fixed" position={[0, FLOOR_Y, 0]} restitution={FLOOR_RESTITUTION} friction={0.9}>
+        <CuboidCollider args={[WALL_HALF_WIDTH, FLOOR_HALF_THICKNESS, WALL_HALF_DEPTH]} />
+      </RigidBody>
       <Walls />
-      <SceneController floorYRef={floorYRef} letterRefs={letterRefs} shadowRef={shadowRef} />
+      <ContactShadows
+        position={[0, FLOOR_Y + SHADOW_ABOVE_FLOOR, 0]}
+        scale={WALL_HALF_WIDTH * 2.2}
+        opacity={0.35}
+        blur={2.8}
+        far={6}
+        resolution={512}
+        color="#000000"
+      />
       {letters.map((letter, i) => (
         <RigidBody
           key={letter.key}
@@ -348,6 +475,11 @@ function FallingLetters() {
             geometry={geometries[letter.char]}
             scale={letter.scale}
             onPointerDown={(event) => {
+              // Ignore pokes on a letter the word-builder currently owns —
+              // don't want a click yanking it out of the kinematic formation.
+              const owningItem = buildRef.current.items.find((it) => it.letterIndex === i)
+              if (owningItem && owningItem.mode === 'kinematic') return
+
               // Deliberately onPointerDown, not onClick: r3f's onClick only fires
               // if the object hit at pointerdown still matches the object hit when
               // the click resolves (its "click-through-drag" guard). These letters
