@@ -7,10 +7,11 @@ import SceneCanvas from '../../shared/SceneCanvas'
 import { useFont, useTextGeometries } from '../../shared/useTypographyGeometries'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
-// Anagrams of "everything moves" — fixed sequence, hardcoded (not generated).
-// Every letter each of these needs already exists somewhere in the pile below,
-// since the pile is drawn from that same phrase's unique-character alphabet.
-const WORDS = ['MOVES', 'SHIVER', 'GROVES', 'NERVES']
+// Fixed sequence, hardcoded (not generated). Words don't need to be strict
+// anagrams of "everything moves" — the pile holds many copies of each of its
+// 12 unique letters, so a word just needs every character it uses to be one
+// of those 12; repeats (like GROOVE's two O's) are fine, there's plenty.
+const WORDS = ['GROOVE', 'MOTHER', 'SHIVER', 'MEMORY']
 
 // The concluding step: the full phrase, two lines — handled as a distinct
 // final segment (see `isFinale` below) since it lays out as two lines instead
@@ -311,6 +312,11 @@ function FallingLetters() {
 
   const letterRefs = useRef([])
   const activeDragRef = useRef(null)
+  // Tags a pile letter as claimed the moment it's selected into a build, and
+  // frees it the moment it's released back to dynamic — so a fresh selection
+  // (a new word, or a reversal reselecting mid-air) never fights an in-flight
+  // letter for the same physical body.
+  const letterInUseRef = useRef(new Array(letters.length).fill(false))
 
   const progressTargetRef = useRef(0) // raw, instantly updated from scroll input
   const progressRef = useRef(0) // damped display value that actually drives the build
@@ -342,7 +348,6 @@ function FallingLetters() {
     const rightVector = new Vector3(1, 0, 0).applyQuaternion(facingQuat)
     const upVector = new Vector3(0, 1, 0).applyQuaternion(facingQuat)
 
-    const usedIndices = new Set()
     const items = []
     const lineCount = lines.length
 
@@ -353,13 +358,13 @@ function FallingLetters() {
       lineChars.forEach((char, k) => {
         let letterIndex = -1
         for (let i = 0; i < letters.length; i++) {
-          if (letters[i].char === char && !usedIndices.has(i)) {
+          if (letters[i].char === char && !letterInUseRef.current[i]) {
             letterIndex = i
             break
           }
         }
         if (letterIndex === -1) return // pile happened to run out of this char — skip gracefully
-        usedIndices.add(letterIndex)
+        letterInUseRef.current[letterIndex] = true
 
         items.push({
           letterIndex,
@@ -393,6 +398,7 @@ function FallingLetters() {
       )
     }
     item.mode = 'dynamic'
+    letterInUseRef.current[item.letterIndex] = false
   }
 
   useFrame((state) => {
