@@ -4,6 +4,7 @@ const EXPERIMENTS = [
   { path: '/type-01', label: 'Type 01', description: 'Scattered typography, instanced glyphs' },
   { path: '/type-02', label: 'Type 02', description: 'Scroll-driven scatter with per-letter lag' },
   { path: '/type-03', label: 'Type 03', description: 'Physics-based falling letters, scroll drops the floor' },
+  { path: '/type-04', label: 'Type 04', description: 'Scroll-driven anagram sequence, letters form and dissolve' },
 ]
 
 export default function Home() {

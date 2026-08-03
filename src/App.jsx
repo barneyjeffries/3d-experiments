@@ -9,6 +9,7 @@ import Home from './pages/Home'
 import Type01 from './experiments/Type01'
 import Type02 from './experiments/Type02'
 import Type03 from './experiments/Type03'
+import Type04 from './experiments/Type04'
 
 function App() {
   return (
@@ -19,6 +20,7 @@ function App() {
         <Route path="/type-01" element={<Type01 />} />
         <Route path="/type-02" element={<Type02 />} />
         <Route path="/type-03" element={<Type03 />} />
+        <Route path="/type-04" element={<Type04 />} />
       </Routes>
     </HashRouter>
   )
