@@ -9,15 +9,16 @@ import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
 // Anagrams of "everything moves" — fixed sequence, hardcoded (not generated).
 // Every letter each of these needs already exists somewhere in the pile below,
-// since the pile is exactly that phrase's letters.
+// since the pile is drawn from that same phrase's unique-character alphabet.
 const WORDS = ['MOVES', 'SHIVER', 'GROVES', 'NERVES']
 
-// The concluding step: the full phrase, two lines, using every pile letter —
-// handled as a distinct final segment (see `isFinale` below) since it spans
-// all of the pile at once and lays out as two lines instead of one row.
+// The concluding step: the full phrase, two lines — handled as a distinct
+// final segment (see `isFinale` below) since it lays out as two lines instead
+// of one row and, unlike the words above, never releases back to the pile.
 const FINALE_LINES = ['everything', 'moves']
 
 const PHRASE = 'everything moves'
+const LETTER_COUNT_RANGE = [280, 350] // a proper dense pile — see the ceiling note near `letters` below
 const GLYPH_SIZE = 1
 const EXTRUDE_DEPTH = 0.15
 const BEVEL_THICKNESS = 0.02
@@ -27,16 +28,15 @@ const ACCENT_COLOR = '#7fff00'
 const ACCENT_RATIO = 0.125
 
 // Spawn volume — letters start scattered mid-air above the floor and drop in
-// on load. Sized for the pile's actual count (exactly 15 — see `letters`
-// below), smaller than a type-03-style pile of hundreds would need.
-const SPAWN_HALF_WIDTH = 2.5
-const SPAWN_HALF_DEPTH = 2.5
+// on load. Sized for a few-hundred-letter pile (type-03-scale, slightly larger).
+const SPAWN_HALF_WIDTH = 5
+const SPAWN_HALF_DEPTH = 5
 const SPAWN_MIN_Y = 3
-const SPAWN_MAX_Y = 8
+const SPAWN_MAX_Y = 10
 
 // Play area — walls keep letters from bouncing out of frame sideways.
-const WALL_HALF_WIDTH = 3.2
-const WALL_HALF_DEPTH = 3.2
+const WALL_HALF_WIDTH = 6
+const WALL_HALF_DEPTH = 6
 const WALL_HALF_HEIGHT = 20
 const WALL_THICKNESS = 0.5
 
@@ -63,7 +63,7 @@ const DRAG_VELOCITY_SMOOTHING = 0.5
 // Scroll -> word-cycle timeline. Raw wheel/touch input accumulates into a 0..1
 // target, which the frame loop damps toward — same shape as type-04's timeline.
 // Sized up from type-04's 8000 to keep each segment's feel now that there are
-// 5 segments (4 anagrams + the finale) sharing the timeline instead of 4.
+// 5 segments (4 words + the finale) sharing the timeline instead of 4.
 const TOTAL_SCROLL_DISTANCE = 10000
 const MAX_WHEEL_DELTA = 120
 const PROGRESS_SMOOTHING = 0.1
@@ -76,7 +76,7 @@ const MIN_PROGRESS_TO_BUILD = 1e-4
 // from wherever the letter was captured — not from a fixed start — so a
 // reversal mid-fall re-uses the exact same curve from whatever point it's at.
 const RISE_SPAN = 0.28
-const RELEASE_AT = 0.7 // local-t threshold: below = held kinematic, at/above = released to physics (anagram steps only — the finale never releases)
+const RELEASE_AT = 0.7 // local-t threshold: below = held kinematic, at/above = released to physics (word steps only — the finale never releases)
 const STAGGER = 0.4 // per-letter spread of rise start, for a non-lockstep cascade
 
 // Formation — centred, facing the camera, rising clear of the pile.
@@ -276,25 +276,38 @@ function FallingLetters() {
     bevelSize: BEVEL_SIZE,
   })
 
-  // The pile itself — exactly the 15 letters of "everything moves" (not a
-  // random sample from its alphabet), one physical body per character
-  // occurrence. That precise multiset is what lets the finale below claim
-  // every single pile letter and empty the floor completely.
+  // The pile itself — a few hundred letters, each independently drawn from
+  // "everything moves"'s 12 unique characters, so every char has many copies
+  // for the word-builder to pick from. Not the exact phrase multiset (that
+  // was tried and made for a thin, sparse pile) — deliberately redundant.
+  //
+  // Performance ceiling: the per-frame cost here is dominated by Rapier
+  // settling this many `colliders="hull"` dynamic bodies on load and letting
+  // them sleep, not by the word-builder (which only ever touches the ~6-20
+  // letters actively selected for the current step, scanning the full pile
+  // just once per step change). 280-350 tracks type-03's proven 150-250 base
+  // reasonably scaled up; if this is pushed much past ~500 on a slower
+  // device, expect the initial fall-and-settle to chug before it's felt
+  // anywhere else.
   const letters = useMemo(() => {
-    const phraseLetters = PHRASE.replace(/\s/g, '').split('')
-    return phraseLetters.map((char, i) => ({
-      key: i,
-      char,
-      position: [
-        randRange(-SPAWN_HALF_WIDTH, SPAWN_HALF_WIDTH),
-        randRange(SPAWN_MIN_Y, SPAWN_MAX_Y),
-        randRange(-SPAWN_HALF_DEPTH, SPAWN_HALF_DEPTH),
-      ],
-      rotation: [randRange(0, Math.PI * 2), randRange(0, Math.PI * 2), randRange(0, Math.PI * 2)],
-      scale: randRange(0.85, 1.15),
-      color: Math.random() < ACCENT_RATIO ? ACCENT_COLOR : BASE_COLOR,
-    }))
-  }, [])
+    const count = Math.round(randRange(...LETTER_COUNT_RANGE))
+    const list = []
+    for (let i = 0; i < count; i++) {
+      list.push({
+        key: i,
+        char: chars[Math.floor(Math.random() * chars.length)],
+        position: [
+          randRange(-SPAWN_HALF_WIDTH, SPAWN_HALF_WIDTH),
+          randRange(SPAWN_MIN_Y, SPAWN_MAX_Y),
+          randRange(-SPAWN_HALF_DEPTH, SPAWN_HALF_DEPTH),
+        ],
+        rotation: [randRange(0, Math.PI * 2), randRange(0, Math.PI * 2), randRange(0, Math.PI * 2)],
+        scale: randRange(0.85, 1.15),
+        color: Math.random() < ACCENT_RATIO ? ACCENT_COLOR : BASE_COLOR,
+      })
+    }
+    return list
+  }, [chars])
 
   const letterRefs = useRef([])
   const activeDragRef = useRef(null)
@@ -396,7 +409,7 @@ function FallingLetters() {
       return
     }
 
-    // 4 anagram steps + 1 finale step, sharing the timeline in equal slices.
+    // 4 word steps + 1 finale step, sharing the timeline in equal slices.
     const stepCount = WORDS.length + 1
     const finaleIndex = stepCount - 1
     const segmentLength = 1 / stepCount
