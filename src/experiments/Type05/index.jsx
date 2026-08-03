@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
-import { ContactShadows } from '@react-three/drei'
 import { Physics, RigidBody, CuboidCollider } from '@react-three/rapier'
 import { RigidBodyType } from '@dimforge/rapier3d-compat'
 import { Object3D, Plane, Quaternion, Raycaster, Vector2, Vector3 } from 'three'
@@ -10,11 +9,15 @@ import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
 // Anagrams of "everything moves" — fixed sequence, hardcoded (not generated).
 // Every letter each of these needs already exists somewhere in the pile below,
-// since the pile is built from that same phrase's unique-character alphabet.
+// since the pile is exactly that phrase's letters.
 const WORDS = ['MOVES', 'SHIVER', 'GROVES', 'NERVES']
 
+// The concluding step: the full phrase, two lines, using every pile letter —
+// handled as a distinct final segment (see `isFinale` below) since it spans
+// all of the pile at once and lays out as two lines instead of one row.
+const FINALE_LINES = ['everything', 'moves']
+
 const PHRASE = 'everything moves'
-const LETTER_COUNT_RANGE = [150, 250]
 const GLYPH_SIZE = 1
 const EXTRUDE_DEPTH = 0.15
 const BEVEL_THICKNESS = 0.02
@@ -23,15 +26,17 @@ const BASE_COLOR = '#fcfcfa'
 const ACCENT_COLOR = '#7fff00'
 const ACCENT_RATIO = 0.125
 
-// Spawn volume — letters start scattered mid-air above the floor and drop in on load.
-const SPAWN_HALF_WIDTH = 4.5
-const SPAWN_HALF_DEPTH = 4.5
+// Spawn volume — letters start scattered mid-air above the floor and drop in
+// on load. Sized for the pile's actual count (exactly 15 — see `letters`
+// below), smaller than a type-03-style pile of hundreds would need.
+const SPAWN_HALF_WIDTH = 2.5
+const SPAWN_HALF_DEPTH = 2.5
 const SPAWN_MIN_Y = 3
-const SPAWN_MAX_Y = 10
+const SPAWN_MAX_Y = 8
 
 // Play area — walls keep letters from bouncing out of frame sideways.
-const WALL_HALF_WIDTH = 5.5
-const WALL_HALF_DEPTH = 5.5
+const WALL_HALF_WIDTH = 3.2
+const WALL_HALF_DEPTH = 3.2
 const WALL_HALF_HEIGHT = 20
 const WALL_THICKNESS = 0.5
 
@@ -39,7 +44,6 @@ const WALL_THICKNESS = 0.5
 // the word-assembly cycle instead, so the pile just settles here once and stays.
 const FLOOR_HALF_THICKNESS = 0.25
 const FLOOR_Y = -4
-const SHADOW_ABOVE_FLOOR = 0.02
 
 // Physics feel — same lively, bouncy tuning as type-03.
 const GRAVITY_Y = -30
@@ -58,24 +62,27 @@ const DRAG_VELOCITY_SMOOTHING = 0.5
 
 // Scroll -> word-cycle timeline. Raw wheel/touch input accumulates into a 0..1
 // target, which the frame loop damps toward — same shape as type-04's timeline.
-const TOTAL_SCROLL_DISTANCE = 8000
+// Sized up from type-04's 8000 to keep each segment's feel now that there are
+// 5 segments (4 anagrams + the finale) sharing the timeline instead of 4.
+const TOTAL_SCROLL_DISTANCE = 10000
 const MAX_WHEEL_DELTA = 120
 const PROGRESS_SMOOTHING = 0.1
 // Below this, treat the timeline as "untouched" so the pile can settle on load
 // without any letters being snatched into kinematic mode before the user scrolls.
 const MIN_PROGRESS_TO_BUILD = 1e-4
 
-// Each word owns an equal slice of the timeline. RISE_SPAN is how much of that
+// Each step owns an equal slice of the timeline. RISE_SPAN is how much of that
 // slice (in local-t units) the rise-into-formation animation spans, measured
 // from wherever the letter was captured — not from a fixed start — so a
 // reversal mid-fall re-uses the exact same curve from whatever point it's at.
 const RISE_SPAN = 0.28
-const RELEASE_AT = 0.7 // local-t threshold: below = held kinematic, at/above = released to physics
+const RELEASE_AT = 0.7 // local-t threshold: below = held kinematic, at/above = released to physics (anagram steps only — the finale never releases)
 const STAGGER = 0.4 // per-letter spread of rise start, for a non-lockstep cascade
 
 // Formation — centred, facing the camera, rising clear of the pile.
 const ASSEMBLE_HEIGHT_ABOVE_FLOOR = 7
 const LETTER_ROW_GAP = 0.14
+const LINE_GAP = 1.3 // vertical spacing between the finale's two lines
 const WOBBLE_AMPLITUDE = 0.03
 const WOBBLE_SPEED_RANGE = [0.3, 0.7]
 
@@ -269,28 +276,25 @@ function FallingLetters() {
     bevelSize: BEVEL_SIZE,
   })
 
-  // The pile itself — untouched from type-03. It's already "the letters of
-  // everything moves" (each drawn from that phrase's unique-character
-  // alphabet), so the word-builder below only ever selects from what's here.
+  // The pile itself — exactly the 15 letters of "everything moves" (not a
+  // random sample from its alphabet), one physical body per character
+  // occurrence. That precise multiset is what lets the finale below claim
+  // every single pile letter and empty the floor completely.
   const letters = useMemo(() => {
-    const count = Math.round(randRange(...LETTER_COUNT_RANGE))
-    const list = []
-    for (let i = 0; i < count; i++) {
-      list.push({
-        key: i,
-        char: chars[Math.floor(Math.random() * chars.length)],
-        position: [
-          randRange(-SPAWN_HALF_WIDTH, SPAWN_HALF_WIDTH),
-          randRange(SPAWN_MIN_Y, SPAWN_MAX_Y),
-          randRange(-SPAWN_HALF_DEPTH, SPAWN_HALF_DEPTH),
-        ],
-        rotation: [randRange(0, Math.PI * 2), randRange(0, Math.PI * 2), randRange(0, Math.PI * 2)],
-        scale: randRange(0.85, 1.15),
-        color: Math.random() < ACCENT_RATIO ? ACCENT_COLOR : BASE_COLOR,
-      })
-    }
-    return list
-  }, [chars])
+    const phraseLetters = PHRASE.replace(/\s/g, '').split('')
+    return phraseLetters.map((char, i) => ({
+      key: i,
+      char,
+      position: [
+        randRange(-SPAWN_HALF_WIDTH, SPAWN_HALF_WIDTH),
+        randRange(SPAWN_MIN_Y, SPAWN_MAX_Y),
+        randRange(-SPAWN_HALF_DEPTH, SPAWN_HALF_DEPTH),
+      ],
+      rotation: [randRange(0, Math.PI * 2), randRange(0, Math.PI * 2), randRange(0, Math.PI * 2)],
+      scale: randRange(0.85, 1.15),
+      color: Math.random() < ACCENT_RATIO ? ACCENT_COLOR : BASE_COLOR,
+    }))
+  }, [])
 
   const letterRefs = useRef([])
   const activeDragRef = useRef(null)
@@ -306,53 +310,61 @@ function FallingLetters() {
   const cameraTmp = useMemo(() => new Object3D(), [])
   const dummyQuat = useMemo(() => new Quaternion(), [])
 
-  // Grabs available pile letters spelling `word`, laid out in a row facing the
-  // camera. Only called once per word transition — reversal within the same
-  // word re-poses the already-selected letters, it doesn't reselect them.
-  function selectWordLetters(wordIndex, camera) {
-    const word = WORDS[wordIndex].toLowerCase()
-    const { letters: wordChars, offsets } = layoutWord(word, geometries, LETTER_ROW_GAP)
-
+  // Grabs available pile letters spelling `lines` (one row per line, stacked
+  // vertically and centred as a block), laid out facing the camera. Only
+  // called once per step transition — reversal within the same step re-poses
+  // the already-selected letters, it doesn't reselect them.
+  function selectLetters(lines, camera) {
     const formationCenter = new Vector3(0, FLOOR_Y + ASSEMBLE_HEIGHT_ABOVE_FLOOR, 0)
     // Pure-yaw facing: project the camera onto the formation's own horizontal
     // plane before aiming, so letters stand upright with no pitch/roll — just
-    // rotated to face the camera's direction. lookAt points -Z at the target,
-    // so the extra rotateY(PI) flips it to +Z (this geometry's front) instead.
+    // rotated to face the camera's direction. For a plain Object3D (unlike a
+    // Camera/Light), `lookAt` already points local +Z — this geometry's front —
+    // straight at the target, so no extra flip is needed here.
     const lookTarget = camera.position.clone()
     lookTarget.y = formationCenter.y
     cameraTmp.position.copy(formationCenter)
     cameraTmp.lookAt(lookTarget)
-    cameraTmp.rotateY(Math.PI)
     const facingQuat = cameraTmp.quaternion.clone()
     const rightVector = new Vector3(1, 0, 0).applyQuaternion(facingQuat)
+    const upVector = new Vector3(0, 1, 0).applyQuaternion(facingQuat)
 
-    const usedThisWord = new Set()
+    const usedIndices = new Set()
     const items = []
-    for (let k = 0; k < wordChars.length; k++) {
-      const char = wordChars[k]
-      let letterIndex = -1
-      for (let i = 0; i < letters.length; i++) {
-        if (letters[i].char === char && !usedThisWord.has(i)) {
-          letterIndex = i
-          break
-        }
-      }
-      if (letterIndex === -1) continue // pile happened to run out of this char — skip gracefully
-      usedThisWord.add(letterIndex)
+    const lineCount = lines.length
 
-      items.push({
-        letterIndex,
-        targetPos: formationCenter.clone().addScaledVector(rightVector, offsets[k]),
-        targetQuat: facingQuat.clone(),
-        capturePos: new Vector3(),
-        captureQuat: new Quaternion(),
-        captureLocalT: 0,
-        mode: 'dynamic', // not yet captured — the per-frame loop below captures it on first pass
-        entryStagger: Math.random(),
-        wobblePhase: randRange(0, TAU),
-        wobbleSpeed: randRange(...WOBBLE_SPEED_RANGE),
+    lines.forEach((line, lineIndex) => {
+      const { letters: lineChars, offsets } = layoutWord(line, geometries, LETTER_ROW_GAP)
+      const lineOffsetY = ((lineCount - 1) / 2 - lineIndex) * LINE_GAP // first line on top
+
+      lineChars.forEach((char, k) => {
+        let letterIndex = -1
+        for (let i = 0; i < letters.length; i++) {
+          if (letters[i].char === char && !usedIndices.has(i)) {
+            letterIndex = i
+            break
+          }
+        }
+        if (letterIndex === -1) return // pile happened to run out of this char — skip gracefully
+        usedIndices.add(letterIndex)
+
+        items.push({
+          letterIndex,
+          targetPos: formationCenter
+            .clone()
+            .addScaledVector(rightVector, offsets[k])
+            .addScaledVector(upVector, lineOffsetY),
+          targetQuat: facingQuat.clone(),
+          capturePos: new Vector3(),
+          captureQuat: new Quaternion(),
+          captureLocalT: 0,
+          mode: 'dynamic', // not yet captured — the per-frame loop below captures it on first pass
+          entryStagger: Math.random(),
+          wobblePhase: randRange(0, TAU),
+          wobbleSpeed: randRange(...WOBBLE_SPEED_RANGE),
+        })
       })
-    }
+    })
     return items
   }
 
@@ -384,20 +396,27 @@ function FallingLetters() {
       return
     }
 
-    const wordCount = WORDS.length
-    const segmentLength = 1 / wordCount
-    const activeWordIndex = Math.min(wordCount - 1, Math.floor(progress * wordCount))
+    // 4 anagram steps + 1 finale step, sharing the timeline in equal slices.
+    const stepCount = WORDS.length + 1
+    const finaleIndex = stepCount - 1
+    const segmentLength = 1 / stepCount
+    const activeWordIndex = Math.min(finaleIndex, Math.floor(progress * stepCount))
     const segStart = activeWordIndex * segmentLength
     const localT = clamp01((progress - segStart) / segmentLength)
+    const isFinale = activeWordIndex === finaleIndex
 
     if (build.wordIndex !== activeWordIndex) {
       for (const item of build.items) releaseItem(item)
       build.wordIndex = activeWordIndex
-      build.items = selectWordLetters(activeWordIndex, state.camera)
+      const lines = isFinale ? FINALE_LINES : [WORDS[activeWordIndex].toLowerCase()]
+      build.items = selectLetters(lines, state.camera)
     }
 
     const t = state.clock.elapsedTime
-    const desiredKinematic = localT < RELEASE_AT
+    // The finale is the sequence's concluding state — it rises and holds,
+    // never releasing back to the pile on its own (only a reversal past its
+    // segment boundary forces a release, via the word-change branch above).
+    const desiredKinematic = isFinale || localT < RELEASE_AT
 
     for (const item of build.items) {
       const mesh = letterRefs.current[item.letterIndex]
@@ -448,15 +467,6 @@ function FallingLetters() {
         <CuboidCollider args={[WALL_HALF_WIDTH, FLOOR_HALF_THICKNESS, WALL_HALF_DEPTH]} />
       </RigidBody>
       <Walls />
-      <ContactShadows
-        position={[0, FLOOR_Y + SHADOW_ABOVE_FLOOR, 0]}
-        scale={WALL_HALF_WIDTH * 2.2}
-        opacity={0.35}
-        blur={2.8}
-        far={6}
-        resolution={512}
-        color="#000000"
-      />
       {letters.map((letter, i) => (
         <RigidBody
           key={letter.key}
