@@ -1,9 +1,43 @@
 import { useEffect, useMemo, useRef } from 'react'
-import { useFrame } from '@react-three/fiber'
-import { BufferAttribute, BufferGeometry, DynamicDrawUsage, ShaderMaterial } from 'three'
+import { useFrame, useThree } from '@react-three/fiber'
+import { BufferAttribute, BufferGeometry, CanvasTexture, DynamicDrawUsage, ShaderMaterial } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
 import Hint from '../../shared/Hint'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
+
+// Flat black reads a little dead as a backdrop, so this replaces
+// SceneCanvas's usual flat scene.background colour with a radial gradient
+// instead — lighting can't help here (scene.background is unlit, and the
+// particle shader below ignores scene lights entirely anyway), so this is
+// the actual lever for "less flat."
+const BACKGROUND_INNER_COLOR = '#1c1c1c' // centre — a soft dark-grey glow
+const BACKGROUND_OUTER_COLOR = '#000000' // edges — fades to true black
+const BACKGROUND_TEXTURE_SIZE = 512
+
+function GradientBackground({ innerColor, outerColor }) {
+  const { scene } = useThree()
+
+  const texture = useMemo(() => {
+    const canvas = document.createElement('canvas')
+    canvas.width = BACKGROUND_TEXTURE_SIZE
+    canvas.height = BACKGROUND_TEXTURE_SIZE
+    const ctx = canvas.getContext('2d')
+    const center = BACKGROUND_TEXTURE_SIZE / 2
+    const gradient = ctx.createRadialGradient(center, center, 0, center, center, center)
+    gradient.addColorStop(0, innerColor)
+    gradient.addColorStop(1, outerColor)
+    ctx.fillStyle = gradient
+    ctx.fillRect(0, 0, BACKGROUND_TEXTURE_SIZE, BACKGROUND_TEXTURE_SIZE)
+    return new CanvasTexture(canvas)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [innerColor, outerColor])
+
+  useEffect(() => {
+    scene.background = texture
+  }, [scene, texture])
+
+  return null
+}
 
 // GPU points-based particle system — a single THREE.Points draw call, not
 // instanced meshes or physics bodies. Position updates are still CPU-side
@@ -581,7 +615,8 @@ function ParticleCloud() {
 export default function Type05() {
   return (
     <>
-      <SceneCanvas cameraPosition={[0, 0, 9]} fov={45} orbitControls={false} background="#000000">
+      <SceneCanvas cameraPosition={[0, 0, 9]} fov={45} orbitControls={false} background={null}>
+        <GradientBackground innerColor={BACKGROUND_INNER_COLOR} outerColor={BACKGROUND_OUTER_COLOR} />
         <ParticleCloud />
       </SceneCanvas>
       <Hint text="type something" dismissOn={['keydown']} dark />
