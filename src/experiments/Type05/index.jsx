@@ -23,9 +23,20 @@ import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 // needs to go lower, halve PARTICLE_COUNT before touching anything else.
 const PARTICLE_COUNT = 6000
 
-const BASE_COLOR = [0.1, 0.1, 0.1] // dark near-black, roughly '#1a1a1a' — reads clearly on the light background
-const ACCENT_COLOR = [0.3, 0.49, 0.06] // dark accent green, roughly '#4d7c0f' — darkened from the acid-green used elsewhere so it still has contrast on a light bg
-const ACCENT_RATIO = 0.12
+// Inverted palette: black background (see Type05() below), white particles
+// that continuously cycle through a colour wheel. Each particle eases
+// through this loop at its own randomised speed and starting phase (see
+// COLOR_CYCLE_SPEED_RANGE below), so the cloud shimmers with colour rather
+// than pulsing in lockstep.
+const COLOR_CYCLE = [
+  [1, 1, 1], // white
+  [1, 0.15, 0.15], // red
+  [1, 0.4, 0.7], // pink
+  [1, 0.55, 0.1], // orange
+  [0.6, 0.25, 0.9], // purple
+  [0.25, 0.45, 1], // blue
+]
+const COLOR_CYCLE_SPEED_RANGE = [0.04, 0.12] // full loops through the wheel per second, per particle
 const POINT_SCALE_RANGE = [0.6, 1.4]
 const BASE_POINT_SIZE = 120 // gl_PointSize numerator before /-mvPosition.z falloff — tune to taste
 
@@ -234,6 +245,11 @@ function ParticleCloud() {
   const formAmounts = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
   const formRates = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
   const posRates = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
+  // Colour attribute — hoisted (rather than local to `geometry` below) since
+  // the frame loop repaints it every frame to animate the colour-cycle.
+  const colors = useMemo(() => new Float32Array(PARTICLE_COUNT * 3), [])
+  const colorPhases = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
+  const colorSpeeds = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
   // Scratch buffer of shuffled POINT indices, used in `formWord` to assign
   // particles to sampled points. Sized to the sampled point count (which
   // varies with word length), not PARTICLE_COUNT — grown lazily, never
@@ -249,7 +265,6 @@ function ParticleCloud() {
 
   const geometry = useMemo(() => {
     const geo = new BufferGeometry()
-    const colors = new Float32Array(PARTICLE_COUNT * 3)
     const scales = new Float32Array(PARTICLE_COUNT)
 
     for (let i = 0; i < PARTICLE_COUNT; i++) {
@@ -267,18 +282,23 @@ function ParticleCloud() {
       formRates[i] = randRange(...FORM_RATE_RANGE)
       posRates[i] = randRange(...POS_RATE_RANGE)
 
-      const isAccent = Math.random() < ACCENT_RATIO
-      const color = isAccent ? ACCENT_COLOR : BASE_COLOR
-      colors[i * 3] = color[0]
-      colors[i * 3 + 1] = color[1]
-      colors[i * 3 + 2] = color[2]
+      // Colour starts at the cycle's first stop (white); the frame loop
+      // takes over from the very first frame, so this is just the pre-mount
+      // resting value.
+      colors[i * 3] = COLOR_CYCLE[0][0]
+      colors[i * 3 + 1] = COLOR_CYCLE[0][1]
+      colors[i * 3 + 2] = COLOR_CYCLE[0][2]
+      colorPhases[i] = Math.random()
+      colorSpeeds[i] = randRange(...COLOR_CYCLE_SPEED_RANGE)
       scales[i] = randRange(...POINT_SCALE_RANGE)
     }
 
     const positionAttribute = new BufferAttribute(positions, 3)
     positionAttribute.setUsage(DynamicDrawUsage)
     geo.setAttribute('position', positionAttribute)
-    geo.setAttribute('aColor', new BufferAttribute(colors, 3))
+    const colorAttribute = new BufferAttribute(colors, 3)
+    colorAttribute.setUsage(DynamicDrawUsage)
+    geo.setAttribute('aColor', colorAttribute)
     geo.setAttribute('aScale', new BufferAttribute(scales, 1))
     return geo
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -530,9 +550,24 @@ function ParticleCloud() {
       positions[ix] += (tx - positions[ix]) * posRate
       positions[iy] += (ty - positions[iy]) * posRate
       positions[iz] += (tz - positions[iz]) * posRate
+
+      // --- colour cycle: this particle's own phase/speed through the
+      // shared wheel, smoothstep-eased between the two nearest stops so the
+      // cycle feels continuous rather than a strobe between flat colours.
+      const cyclePos = (t * colorSpeeds[i] + colorPhases[i]) % 1
+      const segF = cyclePos * COLOR_CYCLE.length
+      const segIndex = Math.floor(segF)
+      const localT = segF - segIndex
+      const eased = localT * localT * (3 - 2 * localT)
+      const c0 = COLOR_CYCLE[segIndex]
+      const c1 = COLOR_CYCLE[(segIndex + 1) % COLOR_CYCLE.length]
+      colors[ix] = c0[0] + (c1[0] - c0[0]) * eased
+      colors[iy] = c0[1] + (c1[1] - c0[1]) * eased
+      colors[iz] = c0[2] + (c1[2] - c0[2]) * eased
     }
 
     geometry.attributes.position.needsUpdate = true
+    geometry.attributes.aColor.needsUpdate = true
   })
 
   return (
@@ -546,10 +581,10 @@ function ParticleCloud() {
 export default function Type05() {
   return (
     <>
-      <SceneCanvas cameraPosition={[0, 0, 9]} fov={45} orbitControls={false}>
+      <SceneCanvas cameraPosition={[0, 0, 9]} fov={45} orbitControls={false} background="#000000">
         <ParticleCloud />
       </SceneCanvas>
-      <Hint text="type something" dismissOn={['keydown']} />
+      <Hint text="type something" dismissOn={['keydown']} dark />
     </>
   )
 }

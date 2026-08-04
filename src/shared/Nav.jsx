@@ -1,12 +1,8 @@
-import { Link } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 
-const linkStyle = {
-  color: '#333',
-  textDecoration: 'none',
-  fontSize: '0.8rem',
-  letterSpacing: '0.02em',
-  pointerEvents: 'auto',
-}
+// Routes with an inverted (black background) scene — the nav switches to
+// light text on these so it stays readable over both themes.
+const DARK_ROUTES = ['/type-05']
 
 const EXPERIMENT_LINKS = [
   { to: '/', label: 'Home' },
@@ -18,6 +14,17 @@ const EXPERIMENT_LINKS = [
 ]
 
 export default function Nav() {
+  const location = useLocation()
+  const isDark = DARK_ROUTES.includes(location.pathname)
+
+  const linkStyle = {
+    color: isDark ? '#f4f4f0' : '#333',
+    textDecoration: 'none',
+    fontSize: '0.8rem',
+    letterSpacing: '0.02em',
+    pointerEvents: 'auto',
+  }
+
   return (
     <nav
       style={{

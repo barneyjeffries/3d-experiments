@@ -36,12 +36,13 @@ export default function SceneCanvas({
   cameraPosition = [10, 8, 10],
   fov = 50,
   orbitControls = true,
+  background = BACKGROUND_COLOR,
   children,
 }) {
   return (
     <ErrorBoundary fallback={SceneErrorNotice}>
       <Canvas style={{ width: '100vw', height: '100vh' }} camera={{ position: cameraPosition, fov }}>
-        <color attach="background" args={[BACKGROUND_COLOR]} />
+        <color attach="background" args={[background]} />
         <ambientLight intensity={0.7} />
         <hemisphereLight args={['#ffffff', '#e4e4de', 0.6]} />
         <directionalLight position={[5, 10, 5]} intensity={0.45} />

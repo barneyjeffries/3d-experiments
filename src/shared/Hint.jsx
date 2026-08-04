@@ -21,8 +21,10 @@ const STORAGE_PREFIX = 'hint-dismissed:'
 // overlay like Nav, not text inside the 3D scene). Fades in shortly after
 // mount, then fades out for good once the user does whatever `dismissOn`
 // listens for — e.g. dismissOn={['wheel', 'touchmove']} for a scroll-driven
-// experiment, dismissOn={['keydown']} for a typing one.
-export default function Hint({ text, dismissOn = [] }) {
+// experiment, dismissOn={['keydown']} for a typing one. Pass `dark` for a
+// scene with an inverted (black) background, so the muted text stays light
+// rather than defaulting to muted-dark-on-light.
+export default function Hint({ text, dismissOn = [], dark = false }) {
   const location = useLocation()
   const storageKey = `${STORAGE_PREFIX}${location.pathname}:${text}`
   const [visible, setVisible] = useState(false)
@@ -56,7 +58,7 @@ export default function Hint({ text, dismissOn = [] }) {
         fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
         fontSize: '0.75rem',
         letterSpacing: '0.04em',
-        color: 'rgba(20, 20, 18, 0.38)',
+        color: dark ? 'rgba(244, 244, 240, 0.45)' : 'rgba(20, 20, 18, 0.38)',
         pointerEvents: 'none',
         zIndex: 10,
         opacity: visible ? 1 : 0,
