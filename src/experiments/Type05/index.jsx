@@ -1,561 +1,555 @@
 import { useEffect, useMemo, useRef } from 'react'
-import { useFrame, useThree } from '@react-three/fiber'
-import { Physics, RigidBody, CuboidCollider } from '@react-three/rapier'
-import { RigidBodyType } from '@dimforge/rapier3d-compat'
-import { Object3D, Plane, Quaternion, Raycaster, Vector2, Vector3 } from 'three'
+import { useFrame } from '@react-three/fiber'
+import { BufferAttribute, BufferGeometry, DynamicDrawUsage, ShaderMaterial } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
 import Hint from '../../shared/Hint'
-import { useFont, useTextGeometries } from '../../shared/useTypographyGeometries'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
-// Fixed sequence, hardcoded (not generated). Words don't need to be strict
-// anagrams of "everything moves" — the pile holds many copies of each of its
-// 12 unique letters, so a word just needs every character it uses to be one
-// of those 12; repeats (like GROOVE's two O's) are fine, there's plenty.
-const WORDS = ['GROOVE', 'MOTHER', 'SHIVER', 'MEMORY']
+// GPU points-based particle system — a single THREE.Points draw call, not
+// instanced meshes or physics bodies. Position updates are still CPU-side
+// (a flat typed-array loop, same cost class as Type02's instanced particles)
+// but rendering is one draw call regardless of count.
+//
+// Typed letters accumulate into a word buffer (see `wordBufferRef`) and the
+// whole buffer is rendered/sampled as one string per keystroke, so multiple
+// letters form side by side, naturally kerned and centred, rather than each
+// keystroke replacing the last.
+//
+// Tune this for the target device (aiming for smooth on iPhone 14). The
+// per-frame cost here is a flat O(N) loop of a handful of trig calls per
+// particle (the curl field) — at 6000 particles that's ~60k Math.cos calls a
+// frame, comfortably inside budget on modern mobile GPUs/CPUs. The ceiling in
+// practice is more about point-sprite fill rate than the JS loop; if this
+// needs to go lower, halve PARTICLE_COUNT before touching anything else.
+const PARTICLE_COUNT = 6000
 
-// The concluding step: the full phrase, two lines — handled as a distinct
-// final segment (see `isFinale` below) since it lays out as two lines instead
-// of one row and, unlike the words above, never releases back to the pile.
-const FINALE_LINES = ['everything', 'moves']
+const BASE_COLOR = [0.1, 0.1, 0.1] // dark near-black, roughly '#1a1a1a' — reads clearly on the light background
+const ACCENT_COLOR = [0.3, 0.49, 0.06] // dark accent green, roughly '#4d7c0f' — darkened from the acid-green used elsewhere so it still has contrast on a light bg
+const ACCENT_RATIO = 0.12
+const POINT_SCALE_RANGE = [0.6, 1.4]
+const BASE_POINT_SIZE = 120 // gl_PointSize numerator before /-mvPosition.z falloff — tune to taste
 
-const PHRASE = 'everything moves'
-const LETTER_COUNT_RANGE = [280, 350] // a proper dense pile — see the ceiling note near `letters` below
-const GLYPH_SIZE = 1
-const EXTRUDE_DEPTH = 0.15
-const BEVEL_THICKNESS = 0.02
-const BEVEL_SIZE = 0.015
-const BASE_COLOR = '#fcfcfa'
-const ACCENT_COLOR = '#7fff00'
-const ACCENT_RATIO = 0.125
+// Idle swirl — particles drift forever via a curl (divergence-free) flow
+// field, so the cloud never looks static even when nothing is forming.
+const SWIRL_HALF_WIDTH = 4.5
+const SWIRL_HALF_HEIGHT = 3
+const SWIRL_HALF_DEPTH = 1.4 // shallow — this is a "mostly flat" scene, not a volumetric one
+const SWIRL_SPEED = 0.55
+// Containment used to be per-axis (clamp X once past its own bound, clamp Y
+// once past ITS own bound, etc.) — that's a rectangular box by construction,
+// which is exactly what read as boxy/cornered: particles slide along a flat
+// wall while only the crossed axis gets pulled back. Fixed by containing on
+// a single ellipsoid RADIUS instead (normalized by the three half-extents
+// above), so the pull-back has no flat faces or corners at all — see the
+// radial containment in the frame loop below.
+const SOFT_RADIUS_START = 0.8 // fraction of the ellipsoid where particles roam completely freely; beyond this, the pull-back ramps up
+const CONTAIN_STRENGTH = 0.9 // spring-like pull-back strength once past SOFT_RADIUS_START — gentle: this only has to stop escape, separation below does the actual spacing work
 
-// Spawn volume — letters start scattered mid-air above the floor and drop in
-// on load. Sized for a few-hundred-letter pile (type-03-scale, slightly larger).
-const SPAWN_HALF_WIDTH = 5
-const SPAWN_HALF_DEPTH = 5
-const SPAWN_MIN_Y = 3
-const SPAWN_MAX_Y = 10
+// Short-range separation — without this, particles have nothing pushing them
+// apart, so over time the (weak) centre containment above is the only net
+// force and they drift together into a dense clump. This is what actually
+// keeps the cloud looking like an evenly-spread nebula rather than either a
+// hard box (old bug) or a soft blob (this one). Grid-bucketed rather than
+// checking every pair (O(n^2) would not stay smooth at thousands of
+// particles) — same spatial-hash approach as Type02's boids-style scatter.
+const SEPARATION_RADIUS = 0.4 // particles closer than this repel each other — the cloud's loose minimum spacing
+const SEPARATION_RADIUS_SQ = SEPARATION_RADIUS * SEPARATION_RADIUS
+const SEPARATION_STRENGTH = 3 // per-neighbour push strength before capping
+const SEPARATION_MAX_FORCE = 2.5 // hard cap on the summed push per particle, so a tight cluster can't fling apart violently
+const MAX_NEIGHBOR_CHECKS = 8 // hard cap on candidates examined per particle per frame
+const SEPARATION_CELL_SIZE = SEPARATION_RADIUS // grid cell size == radius, so a 3x3x3 block of cells covers it
+const GRID_BIAS = 512 // keeps packed cell keys non-negative for this volume's coordinate range
 
-// Play area — walls keep letters from bouncing out of frame sideways.
-const WALL_HALF_WIDTH = 6
-const WALL_HALF_DEPTH = 6
-const WALL_HALF_HEIGHT = 20
-const WALL_THICKNESS = 0.5
+const CELL_OFFSETS = []
+for (let dx = -1; dx <= 1; dx++) {
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dz = -1; dz <= 1; dz++) {
+      CELL_OFFSETS.push([dx, dy, dz])
+    }
+  }
+}
 
-// Floor — fixed. Unlike type-03, scroll no longer drops it; scroll now drives
-// the word-assembly cycle instead, so the pile just settles here once and stays.
-const FLOOR_HALF_THICKNESS = 0.25
-const FLOOR_Y = -4
+function cellKey(ix, iy, iz) {
+  return ((ix + GRID_BIAS) * 1024 + (iy + GRID_BIAS)) * 1024 + (iz + GRID_BIAS)
+}
+// Spatial/time frequencies for the curl field's underlying vector potential.
+// Raised from the original (0.3-0.42) — at that spatial scale, the cosine
+// terms don't complete even half a period across this volume, so the field
+// reads as one coherent "wind" rather than churning local eddies, and can
+// look like it's steadily driving particles toward one side. This is
+// mathematically still exactly divergence-free either way (curl of ANY
+// vector field is — verified analytically, not just asserted), but higher
+// spatial frequency keeps the circulation local instead of domain-spanning.
+const CURL_FREQ = [0.62, 0.74, 0.55, 0.68, 0.58, 0.7]
+const CURL_TIME_SPEED = [0.2, 0.24, 0.18, 0.22, 0.19, 0.26]
+// How strongly a particle's underlying swirl anchor is damped as it commits
+// to a letter (multiplies swirl-advection speed by (1 - formAmount)^this).
+// Higher = swirl gets suppressed harder/sooner, so the target dominates and
+// the shape actually resolves instead of the blend being dragged around by
+// a still-wandering swirl point. 1 = linear falloff, 2 = the current default
+// (strong, matches the "strongly reduce" ask), try 3+ for near-total kill.
+const SWIRL_FORM_SUPPRESSION_POWER = 2
 
-// Physics feel — same lively, bouncy tuning as type-03.
-const GRAVITY_Y = -30
-const RESTITUTION = 0.35
-const FRICTION = 0.6
-const LINEAR_DAMPING = 0.5
-const ANGULAR_DAMPING = 0.6
-const FLOOR_RESTITUTION = 0.1
+// Word formation — render the whole current word buffer as one string to an
+// offscreen canvas (natural kerning, and centring falls out for free since
+// the canvas is sized to the word and we draw centred on it) into a point
+// cloud, then assign every particle an evenly-shuffled sample point to
+// converge on (see `formWord` — a shuffled round-robin, not independent
+// random draws, so every sampled point gets coverage as evenly as the
+// particle budget allows).
+const CANVAS_HEIGHT = 320 // fixed — canvas WIDTH is resized per word to fit, so letters don't shrink as the word grows
+const CANVAS_FONT_PX = 240 // large relative to CANVAS_HEIGHT for a high-resolution, non-clipped sample
+const SAMPLE_STRIDE = 3 // pixel step when scanning the canvas for filled pixels — lower = more sample points, denser shape
+const ALPHA_THRESHOLD = 128
+const LETTER_WORLD_HEIGHT = 6.2 // world-space size CANVAS_HEIGHT maps onto (word width follows from this + the canvas's aspect ratio)
+const LETTER_JITTER = 0.05 // small per-particle scatter around its sampled point, so it doesn't read as a grid
+const LETTER_DEPTH_RANGE = [-0.5, 0.5] // slight parallax — letters stay mostly flat, facing the camera
+const MAX_WORD_LENGTH = 16 // safety cap (e.g. against key-repeat) — beyond this, further letters are ignored until the buffer clears
 
-// Click/tap poke + drag-throw — identical feel to type-03. Ignored on a letter
-// currently claimed by the word-builder (rising, held, or still kinematic).
-const POKE_IMPULSE_STRENGTH = 3
-const THROW_STRENGTH = 0.3
-const MAX_THROW_SPEED = 40
-const DRAG_VELOCITY_SMOOTHING = 0.5
-
-// Scroll -> word-cycle timeline. Raw wheel/touch input accumulates into a 0..1
-// target, which the frame loop damps toward — same shape as type-04's timeline.
-// Sized up from type-04's 8000 to keep each segment's feel now that there are
-// 5 segments (4 words + the finale) sharing the timeline instead of 4.
-const TOTAL_SCROLL_DISTANCE = 10000
-const MAX_WHEEL_DELTA = 120
-const PROGRESS_SMOOTHING = 0.1
-// Below this, treat the timeline as "untouched" so the pile can settle on load
-// without any letters being snatched into kinematic mode before the user scrolls.
-const MIN_PROGRESS_TO_BUILD = 1e-4
-
-// Each step owns an equal slice of the timeline. RISE_SPAN is how much of that
-// slice (in local-t units) the rise-into-formation animation spans, measured
-// from wherever the letter was captured — not from a fixed start — so a
-// reversal mid-fall re-uses the exact same curve from whatever point it's at.
-const RISE_SPAN = 0.28
-const RELEASE_AT = 0.7 // local-t threshold: below = held kinematic, at/above = released to physics (word steps only — the finale never releases)
-const STAGGER = 0.4 // per-letter spread of rise start, for a non-lockstep cascade
-
-// Formation — centred, facing the camera, rising clear of the pile.
-const ASSEMBLE_HEIGHT_ABOVE_FLOOR = 7
-const LETTER_ROW_GAP = 0.14
-const LINE_GAP = 1.3 // vertical spacing between the finale's two lines
-const WOBBLE_AMPLITUDE = 0.03
-const WOBBLE_SPEED_RANGE = [0.3, 0.7]
-
-// A tiny release kick so a dropped letter doesn't just go inert — a light
-// natural tumble as gravity retakes it, not a launch.
-const RELEASE_LINVEL_RANGE = [-0.4, 0.4]
-const RELEASE_ANGVEL_RANGE = [-1, 1]
-
-const TAU = Math.PI * 2
+// Rolling typing window: resets on every keystroke (letter or backspace).
+// While it hasn't elapsed, the current word buffer keeps forming/holding;
+// once it elapses with no further input, the word dissolves back into the
+// swirl and the next letter typed starts a fresh word. ~2-3s per the brief.
+const TYPING_TIMEOUT_MS = 2500
+// This also has to comfortably exceed the time it takes the SLOWEST particle
+// to actually reach its target (see FORM_RATE_RANGE/POS_RATE_RANGE below) —
+// otherwise typing would stop, the timeout would elapse mid-transit, and the
+// word would never read as fully resolved. With the rates below, worst-case
+// transit is ~700-900ms, comfortably inside the window above.
+// Two-stage easing per particle: formAmount (how "word" vs "swirl" this
+// particle's target is) eases toward 0/1 first, then position eases toward
+// that blended target — kept fast/tight so both stages resolve well within
+// TYPING_TIMEOUT_MS, with just enough per-particle spread for an organic
+// (non-lockstep) arrival.
+const FORM_RATE_RANGE = [0.06, 0.12]
+const POS_RATE_RANGE = [0.18, 0.3]
 
 function randRange(min, max) {
   return min + Math.random() * (max - min)
 }
 
-function lerp(a, b, t) {
-  return a + (b - a) * t
+// Resizes the shared canvas to fit `word` at CANVAS_FONT_PX (measuring first,
+// since canvas width has to be set before drawing) and renders it centred.
+// Returns the canvas's actual {width, height} — width varies with word
+// length, height is always CANVAS_HEIGHT. Centring the word at width/2 here
+// is what makes the whole buffer stay centred in the scene as it grows: the
+// pixel-to-world mapping in `formWord` centres on the canvas dimensions, so
+// a wider canvas for a longer word is still centred around world x=0.
+function drawWord(canvasEntry, word, fontFamily) {
+  const { ctx, canvas } = canvasEntry
+  ctx.font = `bold ${CANVAS_FONT_PX}px ${fontFamily}`
+  const measuredWidth = ctx.measureText(word).width
+  const width = Math.max(Math.ceil(measuredWidth + CANVAS_FONT_PX * 0.6), CANVAS_FONT_PX)
+  const height = CANVAS_HEIGHT
+
+  // Resizing a canvas clears it and resets its 2D context state, so the
+  // fillStyle/align/baseline/font below have to be (re-)applied after.
+  if (canvas.width !== width) canvas.width = width
+  if (canvas.height !== height) canvas.height = height
+  ctx.clearRect(0, 0, width, height)
+  ctx.fillStyle = '#ffffff'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.font = `bold ${CANVAS_FONT_PX}px ${fontFamily}`
+  ctx.fillText(word, width / 2, height / 2)
+
+  return { width, height }
 }
 
-function clamp01(v) {
-  return Math.min(1, Math.max(0, v))
-}
-
-function easeOutCubic(t) {
-  const inv = 1 - t
-  return 1 - inv * inv * inv
-}
-
-// Centers a word's letters in a row, spaced by each glyph's actual bounding-box
-// width (post-`.center()`, so TextGeometry has already computed it).
-function layoutWord(word, geometries, gap) {
-  const letters = word.split('')
-  const widths = letters.map((ch) => {
-    const box = geometries[ch].boundingBox
-    return box.max.x - box.min.x
-  })
-  const totalWidth = widths.reduce((sum, w) => sum + w, 0) + gap * (letters.length - 1)
-  let cursor = -totalWidth / 2
-  const offsets = []
-  for (let i = 0; i < letters.length; i++) {
-    offsets.push(cursor + widths[i] / 2)
-    cursor += widths[i] + gap
+// Scans the canvas (already drawn by `drawWord`) for filled pixels and
+// returns them as a flat [x0, y0, x1, y1, ...] array in canvas pixel space.
+function sampleFilledPixels(ctx, width, height) {
+  const { data } = ctx.getImageData(0, 0, width, height)
+  const points = []
+  for (let y = 0; y < height; y += SAMPLE_STRIDE) {
+    const row = y * width
+    for (let x = 0; x < width; x += SAMPLE_STRIDE) {
+      const alpha = data[(row + x) * 4 + 3]
+      if (alpha > ALPHA_THRESHOLD) points.push(x, y)
+    }
   }
-  return { letters, offsets }
+  return points
 }
 
-// Captures wheel/touch input and accumulates a 0..1 scroll target for the
-// word-cycle timeline — the only consumer of scroll here, so the page itself
-// never scrolls.
-function WordCycleScrollControl({ progressTargetRef }) {
-  const { gl } = useThree()
+const VERTEX_SHADER = /* glsl */ `
+  attribute float aScale;
+  attribute vec3 aColor;
+  varying vec3 vColor;
+  uniform float uBaseSize;
+  uniform float uPixelRatio;
+
+  void main() {
+    vColor = aColor;
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    gl_PointSize = uBaseSize * aScale * uPixelRatio / -mvPosition.z;
+    gl_Position = projectionMatrix * mvPosition;
+  }
+`
+
+const FRAGMENT_SHADER = /* glsl */ `
+  varying vec3 vColor;
+
+  void main() {
+    vec2 uv = gl_PointCoord - vec2(0.5);
+    float alpha = smoothstep(0.5, 0.0, length(uv));
+    if (alpha <= 0.01) discard;
+    gl_FragColor = vec4(vColor, alpha);
+  }
+`
+
+function ParticleCloud() {
+  // Offscreen canvas used to rasterize the typed word — created once, reused
+  // (and resized as needed by `drawWord`) for every keystroke.
+  const canvasRef = useRef(null)
+  if (!canvasRef.current) {
+    const canvas = document.createElement('canvas')
+    canvas.width = CANVAS_FONT_PX
+    canvas.height = CANVAS_HEIGHT
+    canvasRef.current = { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true }) }
+  }
+  const fontFamilyRef = useRef('sans-serif')
+  // The word currently being typed. Appended to on each letter keypress,
+  // trimmed on backspace, and cleared once the rolling typing window has
+  // elapsed (see the staleness check in the keydown handler below).
+  const wordBufferRef = useRef('')
 
   useEffect(() => {
-    const el = gl.domElement
-
-    const applyDelta = (rawDelta) => {
-      const delta = Math.max(-MAX_WHEEL_DELTA, Math.min(MAX_WHEEL_DELTA, rawDelta))
-      progressTargetRef.current = clamp01(progressTargetRef.current + delta / TOTAL_SCROLL_DISTANCE)
-    }
-
-    const handleWheel = (event) => {
-      event.preventDefault()
-      applyDelta(event.deltaY)
-    }
-
-    let lastTouchY = null
-    const handleTouchStart = (event) => {
-      lastTouchY = event.touches[0]?.clientY ?? null
-    }
-    const handleTouchMove = (event) => {
-      if (lastTouchY === null) return
-      event.preventDefault()
-      const y = event.touches[0]?.clientY ?? lastTouchY
-      applyDelta((lastTouchY - y) * 2)
-      lastTouchY = y
-    }
-
-    el.addEventListener('wheel', handleWheel, { passive: false })
-    el.addEventListener('touchstart', handleTouchStart, { passive: true })
-    el.addEventListener('touchmove', handleTouchMove, { passive: false })
-    return () => {
-      el.removeEventListener('wheel', handleWheel)
-      el.removeEventListener('touchstart', handleTouchStart)
-      el.removeEventListener('touchmove', handleTouchMove)
-    }
-  }, [gl, progressTargetRef])
-
-  return null
-}
-
-// Camera is static in this scene (the floor no longer drops), but it still
-// needs to actually aim at the pile — R3F just places the camera, it doesn't
-// point it anywhere on its own.
-function CameraAim({ target }) {
-  const { camera } = useThree()
-  useFrame(() => {
-    camera.lookAt(target[0], target[1], target[2])
-  })
-  return null
-}
-
-// Tracks a letter's drag-to-throw globally (one DOM listener, not one per
-// letter). Identical to type-03's version.
-function DragThrowControl({ activeDragRef, letterRefs }) {
-  const { gl, camera } = useThree()
-
-  useEffect(() => {
-    const el = gl.domElement
-    const raycaster = new Raycaster()
-    const pointer = new Vector2()
-    const point = new Vector3()
-
-    const updateRay = (event) => {
-      const rect = el.getBoundingClientRect()
-      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1
-      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1
-      raycaster.setFromCamera(pointer, camera)
-    }
-
-    const handlePointerMove = (event) => {
-      const drag = activeDragRef.current
-      if (!drag || event.pointerId !== drag.pointerId) return
-      updateRay(event)
-      if (!raycaster.ray.intersectPlane(drag.plane, point)) return
-      const now = performance.now()
-      const dt = Math.max((now - drag.lastTime) / 1000, 1 / 120)
-      const instant = point.clone().sub(drag.lastPoint).divideScalar(dt)
-      if (instant.length() > MAX_THROW_SPEED) instant.setLength(MAX_THROW_SPEED)
-      drag.velocity.lerp(instant, DRAG_VELOCITY_SMOOTHING)
-      drag.lastPoint.copy(point)
-      drag.lastTime = now
-    }
-
-    const releaseDrag = (event) => {
-      const drag = activeDragRef.current
-      if (!drag || event.pointerId !== drag.pointerId) return
-      const rigidBody = letterRefs.current[drag.letterIndex]
-      if (rigidBody) {
-        const v = drag.velocity
-        rigidBody.applyImpulseAtPoint(
-          { x: v.x * THROW_STRENGTH, y: v.y * THROW_STRENGTH, z: v.z * THROW_STRENGTH },
-          { x: drag.lastPoint.x, y: drag.lastPoint.y, z: drag.lastPoint.z },
-          true
-        )
-      }
-      activeDragRef.current = null
-    }
-
-    el.addEventListener('pointermove', handlePointerMove)
-    el.addEventListener('pointerup', releaseDrag)
-    el.addEventListener('pointercancel', releaseDrag)
-    return () => {
-      el.removeEventListener('pointermove', handlePointerMove)
-      el.removeEventListener('pointerup', releaseDrag)
-      el.removeEventListener('pointercancel', releaseDrag)
-    }
-  }, [gl, camera, activeDragRef, letterRefs])
-
-  return null
-}
-
-// Invisible static walls on all four sides so letters bounce/pile within frame
-// instead of escaping sideways.
-function Walls() {
-  const sideOffset = WALL_HALF_WIDTH + WALL_THICKNESS / 2
-  const depthOffset = WALL_HALF_DEPTH + WALL_THICKNESS / 2
-  return (
-    <>
-      <RigidBody type="fixed" colliders={false} position={[sideOffset, 0, 0]}>
-        <CuboidCollider args={[WALL_THICKNESS / 2, WALL_HALF_HEIGHT, WALL_HALF_DEPTH]} />
-      </RigidBody>
-      <RigidBody type="fixed" colliders={false} position={[-sideOffset, 0, 0]}>
-        <CuboidCollider args={[WALL_THICKNESS / 2, WALL_HALF_HEIGHT, WALL_HALF_DEPTH]} />
-      </RigidBody>
-      <RigidBody type="fixed" colliders={false} position={[0, 0, depthOffset]}>
-        <CuboidCollider args={[WALL_HALF_WIDTH, WALL_HALF_HEIGHT, WALL_THICKNESS / 2]} />
-      </RigidBody>
-      <RigidBody type="fixed" colliders={false} position={[0, 0, -depthOffset]}>
-        <CuboidCollider args={[WALL_HALF_WIDTH, WALL_HALF_HEIGHT, WALL_THICKNESS / 2]} />
-      </RigidBody>
-    </>
-  )
-}
-
-function FallingLetters() {
-  const font = useFont(fontUrl)
-  const chars = useMemo(() => [...new Set(PHRASE.replace(/\s/g, '').split(''))], [])
-  const geometries = useTextGeometries(font, chars, {
-    size: GLYPH_SIZE,
-    height: EXTRUDE_DEPTH,
-    bevelThickness: BEVEL_THICKNESS,
-    bevelSize: BEVEL_SIZE,
-  })
-
-  // The pile itself — a few hundred letters, each independently drawn from
-  // "everything moves"'s 12 unique characters, so every char has many copies
-  // for the word-builder to pick from. Not the exact phrase multiset (that
-  // was tried and made for a thin, sparse pile) — deliberately redundant.
-  //
-  // Performance ceiling: the per-frame cost here is dominated by Rapier
-  // settling this many `colliders="hull"` dynamic bodies on load and letting
-  // them sleep, not by the word-builder (which only ever touches the ~6-20
-  // letters actively selected for the current step, scanning the full pile
-  // just once per step change). 280-350 tracks type-03's proven 150-250 base
-  // reasonably scaled up; if this is pushed much past ~500 on a slower
-  // device, expect the initial fall-and-settle to chug before it's felt
-  // anywhere else.
-  const letters = useMemo(() => {
-    const count = Math.round(randRange(...LETTER_COUNT_RANGE))
-    const list = []
-    for (let i = 0; i < count; i++) {
-      list.push({
-        key: i,
-        char: chars[Math.floor(Math.random() * chars.length)],
-        position: [
-          randRange(-SPAWN_HALF_WIDTH, SPAWN_HALF_WIDTH),
-          randRange(SPAWN_MIN_Y, SPAWN_MAX_Y),
-          randRange(-SPAWN_HALF_DEPTH, SPAWN_HALF_DEPTH),
-        ],
-        rotation: [randRange(0, Math.PI * 2), randRange(0, Math.PI * 2), randRange(0, Math.PI * 2)],
-        scale: randRange(0.85, 1.15),
-        color: Math.random() < ACCENT_RATIO ? ACCENT_COLOR : BASE_COLOR,
+    const face = new FontFace('Type05GlyphFont', `url(${fontUrl})`)
+    face
+      .load()
+      .then((loaded) => {
+        document.fonts.add(loaded)
+        fontFamilyRef.current = 'Type05GlyphFont'
       })
+      .catch(() => {
+        // Sampling already falls back to sans-serif — nothing else to do.
+      })
+  }, [])
+
+  // Flat typed arrays, mutated directly every frame — same "refs, not React
+  // state, drive the animation" approach as the physics experiments.
+  const positions = useMemo(() => new Float32Array(PARTICLE_COUNT * 3), [])
+  const swirlTargets = useMemo(() => new Float32Array(PARTICLE_COUNT * 3), [])
+  const letterTargets = useMemo(() => new Float32Array(PARTICLE_COUNT * 3), [])
+  const formAmounts = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
+  const formRates = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
+  const posRates = useMemo(() => new Float32Array(PARTICLE_COUNT), [])
+  // Scratch buffer of shuffled POINT indices, used in `formWord` to assign
+  // particles to sampled points. Sized to the sampled point count (which
+  // varies with word length), not PARTICLE_COUNT — grown lazily, never
+  // shrunk, so most keystrokes don't reallocate at all.
+  const pointIndexScratchRef = useRef(new Int32Array(4096))
+  // Spatial hash for separation — cellKey -> array of particle indices.
+  // Rebuilt (bucket arrays cleared and refilled, not reallocated) every
+  // frame from the swirl targets' current positions, then used for
+  // neighbour lookups in the same frame's main update pass below.
+  const gridRef = useRef(new Map())
+
+  const lastKeyTimeRef = useRef(-Infinity)
+
+  const geometry = useMemo(() => {
+    const geo = new BufferGeometry()
+    const colors = new Float32Array(PARTICLE_COUNT * 3)
+    const scales = new Float32Array(PARTICLE_COUNT)
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const x = randRange(-SWIRL_HALF_WIDTH, SWIRL_HALF_WIDTH)
+      const y = randRange(-SWIRL_HALF_HEIGHT, SWIRL_HALF_HEIGHT)
+      const z = randRange(-SWIRL_HALF_DEPTH, SWIRL_HALF_DEPTH)
+      positions[i * 3] = x
+      positions[i * 3 + 1] = y
+      positions[i * 3 + 2] = z
+      swirlTargets[i * 3] = x
+      swirlTargets[i * 3 + 1] = y
+      swirlTargets[i * 3 + 2] = z
+
+      formAmounts[i] = 0
+      formRates[i] = randRange(...FORM_RATE_RANGE)
+      posRates[i] = randRange(...POS_RATE_RANGE)
+
+      const isAccent = Math.random() < ACCENT_RATIO
+      const color = isAccent ? ACCENT_COLOR : BASE_COLOR
+      colors[i * 3] = color[0]
+      colors[i * 3 + 1] = color[1]
+      colors[i * 3 + 2] = color[2]
+      scales[i] = randRange(...POINT_SCALE_RANGE)
     }
-    return list
-  }, [chars])
 
-  const letterRefs = useRef([])
-  const activeDragRef = useRef(null)
-  // Tags a pile letter as claimed the moment it's selected into a build, and
-  // frees it the moment it's released back to dynamic — so a fresh selection
-  // (a new word, or a reversal reselecting mid-air) never fights an in-flight
-  // letter for the same physical body.
-  const letterInUseRef = useRef(new Array(letters.length).fill(false))
+    const positionAttribute = new BufferAttribute(positions, 3)
+    positionAttribute.setUsage(DynamicDrawUsage)
+    geo.setAttribute('position', positionAttribute)
+    geo.setAttribute('aColor', new BufferAttribute(colors, 3))
+    geo.setAttribute('aScale', new BufferAttribute(scales, 1))
+    return geo
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
-  const progressTargetRef = useRef(0) // raw, instantly updated from scroll input
-  const progressRef = useRef(0) // damped display value that actually drives the build
+  const material = useMemo(
+    () =>
+      new ShaderMaterial({
+        vertexShader: VERTEX_SHADER,
+        fragmentShader: FRAGMENT_SHADER,
+        uniforms: {
+          uBaseSize: { value: BASE_POINT_SIZE },
+          uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 2) },
+        },
+        transparent: true,
+        depthWrite: false,
+      }),
+    []
+  )
 
-  // The word currently under construction: which word index owns the active
-  // scroll segment, and the selected pile letters assembling/holding/falling
-  // for it. Cleared and reselected whenever the active word index changes.
-  const buildRef = useRef({ wordIndex: -1, items: [] })
+  // Regenerates the CURRENT WORD BUFFER's target points and reassigns every
+  // particle a sample point to converge on. Called fresh on every keystroke
+  // (letter or backspace) — including mid-form — so the whole arrangement
+  // smoothly retargets as the word grows/shrinks rather than snapping.
+  function formWord() {
+    lastKeyTimeRef.current = performance.now()
+    const word = wordBufferRef.current
+    if (!word) return
 
-  const cameraTmp = useMemo(() => new Object3D(), [])
-  const dummyQuat = useMemo(() => new Quaternion(), [])
+    const { width, height } = drawWord(canvasRef.current, word, fontFamilyRef.current)
+    const pixels = sampleFilledPixels(canvasRef.current.ctx, width, height)
+    const pointCount = pixels.length / 2
 
-  // Grabs available pile letters spelling `lines` (one row per line, stacked
-  // vertically and centred as a block), laid out facing the camera. Only
-  // called once per step transition — reversal within the same step re-poses
-  // the already-selected letters, it doesn't reselect them.
-  function selectLetters(lines, camera) {
-    const formationCenter = new Vector3(0, FLOOR_Y + ASSEMBLE_HEIGHT_ABOVE_FLOOR, 0)
-    // Pure-yaw facing: project the camera onto the formation's own horizontal
-    // plane before aiming, so letters stand upright with no pitch/roll — just
-    // rotated to face the camera's direction. For a plain Object3D (unlike a
-    // Camera/Light), `lookAt` already points local +Z — this geometry's front —
-    // straight at the target, so no extra flip is needed here.
-    const lookTarget = camera.position.clone()
-    lookTarget.y = formationCenter.y
-    cameraTmp.position.copy(formationCenter)
-    cameraTmp.lookAt(lookTarget)
-    const facingQuat = cameraTmp.quaternion.clone()
-    const rightVector = new Vector3(1, 0, 0).applyQuaternion(facingQuat)
-    const upVector = new Vector3(0, 1, 0).applyQuaternion(facingQuat)
+    // Diagnostic: if this ever logs a suspiciously low count (a few dozen or
+    // fewer) for a normal word, the canvas sampling itself is the problem
+    // (font not ready, threshold wrong, glyph clipped) — check this first.
+    // eslint-disable-next-line no-console
+    console.log(`[Type05] "${word}" sampled ${pointCount} points (${width}x${height} canvas, font: ${fontFamilyRef.current})`)
+    if (pointCount === 0) return
 
-    const items = []
-    const lineCount = lines.length
+    // Even coverage: shuffle the sampled points themselves (not which
+    // particle gets which — the point set can be smaller OR LARGER than
+    // PARTICLE_COUNT once a word has several letters), then walk particles
+    // through that shuffled order, wrapping with modulo. That wrap only
+    // matters when pointCount < PARTICLE_COUNT (short words — repeats give
+    // every point several particles); when a longer word means pointCount >
+    // PARTICLE_COUNT, modulo has no effect and this instead picks a
+    // uniformly-random SUBSET of points spanning the whole word, so a
+    // particle-starved long word thins out evenly rather than only
+    // populating whichever letters were sampled first.
+    if (pointIndexScratchRef.current.length < pointCount) {
+      pointIndexScratchRef.current = new Int32Array(pointCount)
+    }
+    const pointIndex = pointIndexScratchRef.current
+    for (let p = 0; p < pointCount; p++) pointIndex[p] = p
+    for (let p = pointCount - 1; p > 0; p--) {
+      const q = Math.floor(Math.random() * (p + 1))
+      const tmp = pointIndex[p]
+      pointIndex[p] = pointIndex[q]
+      pointIndex[q] = tmp
+    }
 
-    lines.forEach((line, lineIndex) => {
-      const { letters: lineChars, offsets } = layoutWord(line, geometries, LETTER_ROW_GAP)
-      const lineOffsetY = ((lineCount - 1) / 2 - lineIndex) * LINE_GAP // first line on top
+    // CANVAS_HEIGHT (not the word-specific `height`, which is the same
+    // value) maps to LETTER_WORLD_HEIGHT; centring on width/2, height/2 here
+    // matches how `drawWord` centred the word on the canvas, so the whole
+    // word — however wide — lands centred at world x=0.
+    const scale = LETTER_WORLD_HEIGHT / CANVAS_HEIGHT
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const p = pointIndex[i % pointCount]
+      const px = pixels[p * 2]
+      const py = pixels[p * 2 + 1]
+      letterTargets[i * 3] = (px - width / 2) * scale + randRange(-LETTER_JITTER, LETTER_JITTER)
+      letterTargets[i * 3 + 1] = -(py - height / 2) * scale + randRange(-LETTER_JITTER, LETTER_JITTER)
+      letterTargets[i * 3 + 2] = randRange(...LETTER_DEPTH_RANGE)
+    }
+  }
 
-      lineChars.forEach((char, k) => {
-        let letterIndex = -1
-        for (let i = 0; i < letters.length; i++) {
-          if (letters[i].char === char && !letterInUseRef.current[i]) {
-            letterIndex = i
-            break
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+
+      const isLetter = event.key.length === 1 && /[a-zA-Z]/.test(event.key)
+      const isBackspace = event.key === 'Backspace'
+      if (!isLetter && !isBackspace) return
+
+      // If the rolling typing window already elapsed (the previous word has
+      // finished dissolving, or would have by now), this keystroke starts a
+      // fresh word rather than appending to stale leftovers.
+      if (performance.now() - lastKeyTimeRef.current >= TYPING_TIMEOUT_MS) {
+        wordBufferRef.current = ''
+      }
+
+      if (isBackspace) {
+        event.preventDefault()
+        wordBufferRef.current = wordBufferRef.current.slice(0, -1)
+      } else if (wordBufferRef.current.length < MAX_WORD_LENGTH) {
+        wordBufferRef.current += event.key.toUpperCase()
+      }
+
+      if (wordBufferRef.current.length > 0) {
+        formWord()
+      } else {
+        // Nothing left to hold — dissolve immediately rather than waiting
+        // out the rest of the window with an empty buffer.
+        lastKeyTimeRef.current = -Infinity
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useFrame((state, delta) => {
+    const t = state.clock.elapsedTime
+    const formTarget = performance.now() - lastKeyTimeRef.current < TYPING_TIMEOUT_MS ? 1 : 0
+
+    // Curl field frequencies/speeds — see CURL_FREQ/CURL_TIME_SPEED above.
+    const [fa, fb, fc, fd, fe, ff] = CURL_FREQ
+    const [wa, wb, wc, wd, we, wf] = CURL_TIME_SPEED
+
+    // Pass 1: bucket every particle's current swirl-target position into the
+    // spatial grid, so pass 2's neighbour lookups see a consistent snapshot
+    // rather than a mix of already-updated and not-yet-updated positions.
+    const grid = gridRef.current
+    for (const bucket of grid.values()) bucket.length = 0
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const ix = i * 3
+      const key = cellKey(
+        Math.floor(swirlTargets[ix] / SEPARATION_CELL_SIZE),
+        Math.floor(swirlTargets[ix + 1] / SEPARATION_CELL_SIZE),
+        Math.floor(swirlTargets[ix + 2] / SEPARATION_CELL_SIZE)
+      )
+      let bucket = grid.get(key)
+      if (!bucket) {
+        bucket = []
+        grid.set(key, bucket)
+      }
+      bucket.push(i)
+    }
+
+    // Pass 2: curl + containment + separation + easing toward the (possibly
+    // letter-blended) target.
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const ix = i * 3
+      const iy = ix + 1
+      const iz = ix + 2
+
+      // --- advect this particle's swirl target through the curl field.
+      // Always running (even while mid-letter, so the swirl has somewhere
+      // fresh to release back into once it dissolves) but damped by
+      // swirlSuppression below the more committed this particle is to
+      // forming — otherwise the swirl keeps dragging the blended target
+      // around for as long as it has any weight at all, and the letter
+      // never quite settles (see SWIRL_FORM_SUPPRESSION_POWER above).
+      const prevAmt = formAmounts[i]
+      const swirlSuppression = Math.pow(1 - prevAmt, SWIRL_FORM_SUPPRESSION_POWER)
+
+      const sx = swirlTargets[ix]
+      const sy = swirlTargets[iy]
+      const sz = swirlTargets[iz]
+
+      // curl of vector potential (Fx,Fy,Fz) built from sines — curl is
+      // identically divergence-free for any potential, so this can't
+      // collapse or blow up particles no matter how the frequencies are tuned.
+      let vx = ff * Math.cos(sy * ff + t * wf) - fc * Math.cos(sz * fc + t * wc)
+      let vy = fb * Math.cos(sz * fb + t * wb) - fe * Math.cos(sx * fe + t * we)
+      let vz = fd * Math.cos(sx * fd + t * wd) - fa * Math.cos(sy * fa + t * wa)
+
+      // Radial (ellipsoidal) soft containment — normalize position by the
+      // three half-extents so "1.0" is the nominal boundary regardless of
+      // aspect ratio, then pull back along the position vector itself once
+      // past SOFT_RADIUS_START. No per-axis clamp, so no flat wall to slide
+      // along and no corners where two walls meet — just a smooth, edgeless
+      // spring toward the centre that only engages near the outer boundary.
+      const nx = sx / SWIRL_HALF_WIDTH
+      const ny = sy / SWIRL_HALF_HEIGHT
+      const nz = sz / SWIRL_HALF_DEPTH
+      const r = Math.sqrt(nx * nx + ny * ny + nz * nz)
+      if (r > SOFT_RADIUS_START) {
+        const pull = (r - SOFT_RADIUS_START) * CONTAIN_STRENGTH
+        vx -= sx * pull
+        vy -= sy * pull
+        vz -= sz * pull
+      }
+
+      // Short-range separation from nearby swirl targets, via the grid
+      // bucketed in pass 1 above — this is what actually stops the cloud
+      // collapsing into a clump (containment alone only pushes inward at
+      // the edges; nothing was pushing particles apart). Capped both in
+      // candidates examined and in resulting force, so a dense cluster
+      // can't spike into a huge single-frame push.
+      const gx = Math.floor(sx / SEPARATION_CELL_SIZE)
+      const gy = Math.floor(sy / SEPARATION_CELL_SIZE)
+      const gz = Math.floor(sz / SEPARATION_CELL_SIZE)
+      let sepX = 0
+      let sepY = 0
+      let sepZ = 0
+      let checked = 0
+      for (let oi = 0; oi < CELL_OFFSETS.length && checked < MAX_NEIGHBOR_CHECKS; oi++) {
+        const [ox, oy, oz] = CELL_OFFSETS[oi]
+        const bucket = grid.get(cellKey(gx + ox, gy + oy, gz + oz))
+        if (!bucket) continue
+        for (let bi = 0; bi < bucket.length && checked < MAX_NEIGHBOR_CHECKS; bi++) {
+          const j = bucket[bi]
+          if (j === i) continue
+          checked++
+          const jx = j * 3
+          const ddx = sx - swirlTargets[jx]
+          const ddy = sy - swirlTargets[jx + 1]
+          const ddz = sz - swirlTargets[jx + 2]
+          const distSq = ddx * ddx + ddy * ddy + ddz * ddz
+          if (distSq > 1e-6 && distSq < SEPARATION_RADIUS_SQ) {
+            const dist = Math.sqrt(distSq)
+            const push = (SEPARATION_RADIUS - dist) / SEPARATION_RADIUS / dist
+            sepX += ddx * push
+            sepY += ddy * push
+            sepZ += ddz * push
           }
         }
-        if (letterIndex === -1) return // pile happened to run out of this char — skip gracefully
-        letterInUseRef.current[letterIndex] = true
-
-        items.push({
-          letterIndex,
-          targetPos: formationCenter
-            .clone()
-            .addScaledVector(rightVector, offsets[k])
-            .addScaledVector(upVector, lineOffsetY),
-          targetQuat: facingQuat.clone(),
-          capturePos: new Vector3(),
-          captureQuat: new Quaternion(),
-          captureLocalT: 0,
-          mode: 'dynamic', // not yet captured — the per-frame loop below captures it on first pass
-          entryStagger: Math.random(),
-          wobblePhase: randRange(0, TAU),
-          wobbleSpeed: randRange(...WOBBLE_SPEED_RANGE),
-        })
-      })
-    })
-    return items
-  }
-
-  function releaseItem(item) {
-    if (item.mode !== 'kinematic') return
-    const mesh = letterRefs.current[item.letterIndex]
-    if (mesh) {
-      mesh.setBodyType(RigidBodyType.Dynamic, true)
-      mesh.setLinvel({ x: randRange(...RELEASE_LINVEL_RANGE), y: 0, z: randRange(...RELEASE_LINVEL_RANGE) }, true)
-      mesh.setAngvel(
-        { x: randRange(...RELEASE_ANGVEL_RANGE), y: randRange(...RELEASE_ANGVEL_RANGE), z: randRange(...RELEASE_ANGVEL_RANGE) },
-        true
-      )
-    }
-    item.mode = 'dynamic'
-    letterInUseRef.current[item.letterIndex] = false
-  }
-
-  useFrame((state) => {
-    progressRef.current += (progressTargetRef.current - progressRef.current) * PROGRESS_SMOOTHING
-    const progress = progressRef.current
-    const build = buildRef.current
-
-    if (progress < MIN_PROGRESS_TO_BUILD) {
-      // Untouched: let the pile settle with nothing captured, and forget any
-      // previous selection so scrolling back down starts a clean rise.
-      for (const item of build.items) releaseItem(item)
-      build.wordIndex = -1
-      build.items = []
-      return
-    }
-
-    // 4 word steps + 1 finale step, sharing the timeline in equal slices.
-    const stepCount = WORDS.length + 1
-    const finaleIndex = stepCount - 1
-    const segmentLength = 1 / stepCount
-    const activeWordIndex = Math.min(finaleIndex, Math.floor(progress * stepCount))
-    const segStart = activeWordIndex * segmentLength
-    const localT = clamp01((progress - segStart) / segmentLength)
-    const isFinale = activeWordIndex === finaleIndex
-
-    if (build.wordIndex !== activeWordIndex) {
-      for (const item of build.items) releaseItem(item)
-      build.wordIndex = activeWordIndex
-      const lines = isFinale ? FINALE_LINES : [WORDS[activeWordIndex].toLowerCase()]
-      build.items = selectLetters(lines, state.camera)
-    }
-
-    const t = state.clock.elapsedTime
-    // The finale is the sequence's concluding state — it rises and holds,
-    // never releasing back to the pile on its own (only a reversal past its
-    // segment boundary forces a release, via the word-change branch above).
-    const desiredKinematic = isFinale || localT < RELEASE_AT
-
-    for (const item of build.items) {
-      const mesh = letterRefs.current[item.letterIndex]
-      if (!mesh) continue
-
-      if (desiredKinematic && item.mode !== 'kinematic') {
-        // Capture wherever the letter currently is — whether resting in the
-        // pile (fresh word) or mid-fall (a reversal catching it) — and start
-        // the rise from exactly that pose. No pop either way.
-        const p = mesh.translation()
-        const r = mesh.rotation()
-        item.capturePos.set(p.x, p.y, p.z)
-        item.captureQuat.set(r.x, r.y, r.z, r.w)
-        item.captureLocalT = localT
-        item.mode = 'kinematic'
-        mesh.setLinvel({ x: 0, y: 0, z: 0 }, true)
-        mesh.setAngvel({ x: 0, y: 0, z: 0 }, true)
-        mesh.setBodyType(RigidBodyType.KinematicPositionBased, true)
-      } else if (!desiredKinematic && item.mode === 'kinematic') {
-        releaseItem(item)
       }
-
-      if (item.mode === 'kinematic') {
-        const span = Math.abs(localT - item.captureLocalT)
-        const raw = clamp01(span / RISE_SPAN)
-        const staggered = clamp01((raw - item.entryStagger * STAGGER) / (1 - STAGGER))
-        const eased = easeOutCubic(staggered)
-        const wobble = Math.sin(t * item.wobbleSpeed + item.wobblePhase) * WOBBLE_AMPLITUDE * eased
-
-        dummyQuat.copy(item.captureQuat).slerp(item.targetQuat, eased)
-        mesh.setNextKinematicTranslation({
-          x: lerp(item.capturePos.x, item.targetPos.x, eased),
-          y: lerp(item.capturePos.y, item.targetPos.y, eased) + wobble,
-          z: lerp(item.capturePos.z, item.targetPos.z, eased),
-        })
-        mesh.setNextKinematicRotation({ x: dummyQuat.x, y: dummyQuat.y, z: dummyQuat.z, w: dummyQuat.w })
+      sepX *= SEPARATION_STRENGTH
+      sepY *= SEPARATION_STRENGTH
+      sepZ *= SEPARATION_STRENGTH
+      const sepLenSq = sepX * sepX + sepY * sepY + sepZ * sepZ
+      if (sepLenSq > SEPARATION_MAX_FORCE * SEPARATION_MAX_FORCE) {
+        const s = SEPARATION_MAX_FORCE / Math.sqrt(sepLenSq)
+        sepX *= s
+        sepY *= s
+        sepZ *= s
       }
-      // else: released — physics owns it entirely, no scripted control.
+      vx += sepX
+      vy += sepY
+      vz += sepZ
+
+      swirlTargets[ix] = sx + vx * SWIRL_SPEED * swirlSuppression * delta
+      swirlTargets[iy] = sy + vy * SWIRL_SPEED * swirlSuppression * delta
+      swirlTargets[iz] = sz + vz * SWIRL_SPEED * swirlSuppression * delta
+
+      // --- ease this particle's own form amount toward the shared target.
+      const amt = prevAmt + (formTarget - prevAmt) * formRates[i]
+      formAmounts[i] = amt
+
+      // --- blend swirl vs. letter target, then ease position toward it.
+      const tx = swirlTargets[ix] + (letterTargets[ix] - swirlTargets[ix]) * amt
+      const ty = swirlTargets[iy] + (letterTargets[iy] - swirlTargets[iy]) * amt
+      const tz = swirlTargets[iz] + (letterTargets[iz] - swirlTargets[iz]) * amt
+
+      const posRate = posRates[i]
+      positions[ix] += (tx - positions[ix]) * posRate
+      positions[iy] += (ty - positions[iy]) * posRate
+      positions[iz] += (tz - positions[iz]) * posRate
     }
+
+    geometry.attributes.position.needsUpdate = true
   })
 
   return (
-    <Physics gravity={[0, GRAVITY_Y, 0]}>
-      <WordCycleScrollControl progressTargetRef={progressTargetRef} />
-      <DragThrowControl activeDragRef={activeDragRef} letterRefs={letterRefs} />
-      <CameraAim target={[0, FLOOR_Y + 1, 0]} />
-      <RigidBody type="fixed" position={[0, FLOOR_Y, 0]} restitution={FLOOR_RESTITUTION} friction={0.9}>
-        <CuboidCollider args={[WALL_HALF_WIDTH, FLOOR_HALF_THICKNESS, WALL_HALF_DEPTH]} />
-      </RigidBody>
-      <Walls />
-      {letters.map((letter, i) => (
-        <RigidBody
-          key={letter.key}
-          ref={(el) => (letterRefs.current[i] = el)}
-          colliders="hull"
-          position={letter.position}
-          rotation={letter.rotation}
-          restitution={RESTITUTION}
-          friction={FRICTION}
-          linearDamping={LINEAR_DAMPING}
-          angularDamping={ANGULAR_DAMPING}
-        >
-          {/* Convex hull is an approximation — letterforms are concave, but a hull
-              is cheap and stable and fills the concavities. Good enough for this pass. */}
-          <mesh
-            geometry={geometries[letter.char]}
-            scale={letter.scale}
-            onPointerDown={(event) => {
-              // Ignore pokes on a letter the word-builder currently owns —
-              // don't want a click yanking it out of the kinematic formation.
-              const owningItem = buildRef.current.items.find((it) => it.letterIndex === i)
-              if (owningItem && owningItem.mode === 'kinematic') return
-
-              // Deliberately onPointerDown, not onClick: r3f's onClick only fires
-              // if the object hit at pointerdown still matches the object hit when
-              // the click resolves (its "click-through-drag" guard). These letters
-              // are always moving at least a little — falling, tumbling, settling —
-              // so that match very often fails and onClick silently never fires.
-              // onPointerDown raycasts fresh on press with no such gate, and reads
-              // as a more natural "poke" (immediate on press) besides.
-              event.stopPropagation()
-              const rigidBody = letterRefs.current[i]
-              if (!rigidBody) return
-              const dir = event.ray.direction
-              rigidBody.applyImpulseAtPoint(
-                { x: dir.x * POKE_IMPULSE_STRENGTH, y: dir.y * POKE_IMPULSE_STRENGTH, z: dir.z * POKE_IMPULSE_STRENGTH },
-                { x: event.point.x, y: event.point.y, z: event.point.z },
-                true
-              )
-
-              // Start tracking a potential drag-to-throw on top of the poke above —
-              // DragThrowControl reads/updates this and applies the release impulse.
-              const normal = new Vector3()
-              event.camera.getWorldDirection(normal)
-              activeDragRef.current = {
-                pointerId: event.pointerId,
-                letterIndex: i,
-                plane: new Plane().setFromNormalAndCoplanarPoint(normal, event.point),
-                lastPoint: event.point.clone(),
-                lastTime: performance.now(),
-                velocity: new Vector3(),
-              }
-            }}
-          >
-            <meshStandardMaterial color={letter.color} roughness={0.85} metalness={0} />
-          </mesh>
-        </RigidBody>
-      ))}
-    </Physics>
+    <points frustumCulled={false}>
+      <primitive object={geometry} attach="geometry" />
+      <primitive object={material} attach="material" />
+    </points>
   )
 }
 
 export default function Type05() {
   return (
     <>
-      <SceneCanvas orbitControls={false}>
-        <FallingLetters />
+      <SceneCanvas cameraPosition={[0, 0, 9]} fov={45} orbitControls={false}>
+        <ParticleCloud />
       </SceneCanvas>
-      <Hint text="scroll" dismissOn={['wheel', 'touchmove']} />
+      <Hint text="type something" dismissOn={['keydown']} />
     </>
   )
 }

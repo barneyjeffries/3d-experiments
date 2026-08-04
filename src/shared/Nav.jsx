@@ -15,7 +15,6 @@ const EXPERIMENT_LINKS = [
   { to: '/type-03', label: '03' },
   { to: '/type-04', label: '04' },
   { to: '/type-05', label: '05' },
-  { to: '/type-06', label: '06' },
 ]
 
 export default function Nav() {

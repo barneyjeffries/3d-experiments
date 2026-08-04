@@ -7,9 +7,14 @@ import { useLocation } from 'react-router-dom'
 const FADE_IN_DELAY_MS = 1000
 const FADE_DURATION_MS = 700
 
-// Keyed by route in sessionStorage, so a dismissed hint doesn't reappear on
-// revisiting the same experiment within the same tab/session — but does on
-// a fresh visit.
+// Keyed by route AND text in sessionStorage, so a dismissed hint doesn't
+// reappear on revisiting the same experiment within the same tab/session —
+// but does on a fresh visit. Including the text (not just the path) matters
+// whenever a route's experiment gets swapped or its wording edited: without
+// it, a dismissal recorded against the OLD content at that path would
+// silently suppress a completely different hint that later ends up at the
+// same URL (this bit us once already — a route renumbering left a stale
+// dismissed-by-scrolling flag that hid the new "type something" prompt).
 const STORAGE_PREFIX = 'hint-dismissed:'
 
 // Small, muted on-screen prompt overlaid on top of a scene's canvas (an HTML
@@ -19,7 +24,7 @@ const STORAGE_PREFIX = 'hint-dismissed:'
 // experiment, dismissOn={['keydown']} for a typing one.
 export default function Hint({ text, dismissOn = [] }) {
   const location = useLocation()
-  const storageKey = `${STORAGE_PREFIX}${location.pathname}`
+  const storageKey = `${STORAGE_PREFIX}${location.pathname}:${text}`
   const [visible, setVisible] = useState(false)
 
   useEffect(() => {
