@@ -36,8 +36,36 @@ const SWIRL_SPEED = 0.55
 // a single ellipsoid RADIUS instead (normalized by the three half-extents
 // above), so the pull-back has no flat faces or corners at all — see the
 // radial containment in the frame loop below.
-const SOFT_RADIUS_START = 0.65 // fraction of the ellipsoid where particles roam freely; beyond this, the pull-back ramps up
-const CONTAIN_STRENGTH = 1.4 // spring-like pull-back strength once past SOFT_RADIUS_START
+const SOFT_RADIUS_START = 0.8 // fraction of the ellipsoid where particles roam completely freely; beyond this, the pull-back ramps up
+const CONTAIN_STRENGTH = 0.9 // spring-like pull-back strength once past SOFT_RADIUS_START — gentle: this only has to stop escape, separation below does the actual spacing work
+
+// Short-range separation — without this, particles have nothing pushing them
+// apart, so over time the (weak) centre containment above is the only net
+// force and they drift together into a dense clump. This is what actually
+// keeps the cloud looking like an evenly-spread nebula rather than either a
+// hard box (old bug) or a soft blob (this one). Grid-bucketed rather than
+// checking every pair (O(n^2) would not stay smooth at thousands of
+// particles) — same spatial-hash approach as Type02's boids-style scatter.
+const SEPARATION_RADIUS = 0.4 // particles closer than this repel each other — the cloud's loose minimum spacing
+const SEPARATION_RADIUS_SQ = SEPARATION_RADIUS * SEPARATION_RADIUS
+const SEPARATION_STRENGTH = 3 // per-neighbour push strength before capping
+const SEPARATION_MAX_FORCE = 2.5 // hard cap on the summed push per particle, so a tight cluster can't fling apart violently
+const MAX_NEIGHBOR_CHECKS = 8 // hard cap on candidates examined per particle per frame
+const SEPARATION_CELL_SIZE = SEPARATION_RADIUS // grid cell size == radius, so a 3x3x3 block of cells covers it
+const GRID_BIAS = 512 // keeps packed cell keys non-negative for this volume's coordinate range
+
+const CELL_OFFSETS = []
+for (let dx = -1; dx <= 1; dx++) {
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dz = -1; dz <= 1; dz++) {
+      CELL_OFFSETS.push([dx, dy, dz])
+    }
+  }
+}
+
+function cellKey(ix, iy, iz) {
+  return ((ix + GRID_BIAS) * 1024 + (iy + GRID_BIAS)) * 1024 + (iz + GRID_BIAS)
+}
 // Spatial/time frequencies for the curl field's underlying vector potential.
 // Raised from the original (0.3-0.42) — at that spatial scale, the cosine
 // terms don't complete even half a period across this volume, so the field
@@ -172,6 +200,11 @@ function ParticleCloud() {
   // Scratch buffer for the shuffled point-index assignment computed in
   // `formLetter` on every keystroke — reused rather than reallocated.
   const assignmentScratch = useMemo(() => new Int32Array(PARTICLE_COUNT), [])
+  // Spatial hash for separation — cellKey -> array of particle indices.
+  // Rebuilt (bucket arrays cleared and refilled, not reallocated) every
+  // frame from the swirl targets' current positions, then used for
+  // neighbour lookups in the same frame's main update pass below.
+  const gridRef = useRef(new Map())
 
   const lastKeyTimeRef = useRef(-Infinity)
 
@@ -292,6 +325,28 @@ function ParticleCloud() {
     const [fa, fb, fc, fd, fe, ff] = CURL_FREQ
     const [wa, wb, wc, wd, we, wf] = CURL_TIME_SPEED
 
+    // Pass 1: bucket every particle's current swirl-target position into the
+    // spatial grid, so pass 2's neighbour lookups see a consistent snapshot
+    // rather than a mix of already-updated and not-yet-updated positions.
+    const grid = gridRef.current
+    for (const bucket of grid.values()) bucket.length = 0
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const ix = i * 3
+      const key = cellKey(
+        Math.floor(swirlTargets[ix] / SEPARATION_CELL_SIZE),
+        Math.floor(swirlTargets[ix + 1] / SEPARATION_CELL_SIZE),
+        Math.floor(swirlTargets[ix + 2] / SEPARATION_CELL_SIZE)
+      )
+      let bucket = grid.get(key)
+      if (!bucket) {
+        bucket = []
+        grid.set(key, bucket)
+      }
+      bucket.push(i)
+    }
+
+    // Pass 2: curl + containment + separation + easing toward the (possibly
+    // letter-blended) target.
     for (let i = 0; i < PARTICLE_COUNT; i++) {
       const ix = i * 3
       const iy = ix + 1
@@ -334,6 +389,55 @@ function ParticleCloud() {
         vy -= sy * pull
         vz -= sz * pull
       }
+
+      // Short-range separation from nearby swirl targets, via the grid
+      // bucketed in pass 1 above — this is what actually stops the cloud
+      // collapsing into a clump (containment alone only pushes inward at
+      // the edges; nothing was pushing particles apart). Capped both in
+      // candidates examined and in resulting force, so a dense cluster
+      // can't spike into a huge single-frame push.
+      const gx = Math.floor(sx / SEPARATION_CELL_SIZE)
+      const gy = Math.floor(sy / SEPARATION_CELL_SIZE)
+      const gz = Math.floor(sz / SEPARATION_CELL_SIZE)
+      let sepX = 0
+      let sepY = 0
+      let sepZ = 0
+      let checked = 0
+      for (let oi = 0; oi < CELL_OFFSETS.length && checked < MAX_NEIGHBOR_CHECKS; oi++) {
+        const [ox, oy, oz] = CELL_OFFSETS[oi]
+        const bucket = grid.get(cellKey(gx + ox, gy + oy, gz + oz))
+        if (!bucket) continue
+        for (let bi = 0; bi < bucket.length && checked < MAX_NEIGHBOR_CHECKS; bi++) {
+          const j = bucket[bi]
+          if (j === i) continue
+          checked++
+          const jx = j * 3
+          const ddx = sx - swirlTargets[jx]
+          const ddy = sy - swirlTargets[jx + 1]
+          const ddz = sz - swirlTargets[jx + 2]
+          const distSq = ddx * ddx + ddy * ddy + ddz * ddz
+          if (distSq > 1e-6 && distSq < SEPARATION_RADIUS_SQ) {
+            const dist = Math.sqrt(distSq)
+            const push = (SEPARATION_RADIUS - dist) / SEPARATION_RADIUS / dist
+            sepX += ddx * push
+            sepY += ddy * push
+            sepZ += ddz * push
+          }
+        }
+      }
+      sepX *= SEPARATION_STRENGTH
+      sepY *= SEPARATION_STRENGTH
+      sepZ *= SEPARATION_STRENGTH
+      const sepLenSq = sepX * sepX + sepY * sepY + sepZ * sepZ
+      if (sepLenSq > SEPARATION_MAX_FORCE * SEPARATION_MAX_FORCE) {
+        const s = SEPARATION_MAX_FORCE / Math.sqrt(sepLenSq)
+        sepX *= s
+        sepY *= s
+        sepZ *= s
+      }
+      vx += sepX
+      vy += sepY
+      vz += sepZ
 
       swirlTargets[ix] = sx + vx * SWIRL_SPEED * swirlSuppression * delta
       swirlTargets[iy] = sy + vy * SWIRL_SPEED * swirlSuppression * delta
