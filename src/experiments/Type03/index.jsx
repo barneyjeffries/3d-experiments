@@ -4,6 +4,7 @@ import { ContactShadows } from '@react-three/drei'
 import { Physics, RigidBody, CuboidCollider } from '@react-three/rapier'
 import { Euler, Plane, Quaternion, Raycaster, Vector2, Vector3 } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
+import Hint from '../../shared/Hint'
 import { useFont, useTextGeometries } from '../../shared/useTypographyGeometries'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
@@ -389,8 +390,11 @@ function FallingLetters() {
 
 export default function Type03() {
   return (
-    <SceneCanvas orbitControls={false}>
-      <FallingLetters />
-    </SceneCanvas>
+    <>
+      <SceneCanvas orbitControls={false}>
+        <FallingLetters />
+      </SceneCanvas>
+      <Hint text="scroll to drop" dismissOn={['wheel', 'touchmove']} />
+    </>
   )
 }

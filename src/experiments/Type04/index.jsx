@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
 import { Instances, Instance } from '@react-three/drei'
 import SceneCanvas from '../../shared/SceneCanvas'
+import Hint from '../../shared/Hint'
 import { useFont, useTextGeometries } from '../../shared/useTypographyGeometries'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
@@ -270,8 +271,11 @@ function AnagramSequence() {
 
 export default function Type04() {
   return (
-    <SceneCanvas cameraPosition={[0, 0.2, 8.5]} fov={42} orbitControls={false}>
-      <AnagramSequence />
-    </SceneCanvas>
+    <>
+      <SceneCanvas cameraPosition={[0, 0.2, 8.5]} fov={42} orbitControls={false}>
+        <AnagramSequence />
+      </SceneCanvas>
+      <Hint text="scroll" dismissOn={['wheel', 'touchmove']} />
+    </>
   )
 }

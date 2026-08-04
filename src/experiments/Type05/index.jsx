@@ -4,6 +4,7 @@ import { Physics, RigidBody, CuboidCollider } from '@react-three/rapier'
 import { RigidBodyType } from '@dimforge/rapier3d-compat'
 import { Object3D, Plane, Quaternion, Raycaster, Vector2, Vector3 } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
+import Hint from '../../shared/Hint'
 import { useFont, useTextGeometries } from '../../shared/useTypographyGeometries'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
@@ -550,8 +551,11 @@ function FallingLetters() {
 
 export default function Type05() {
   return (
-    <SceneCanvas orbitControls={false}>
-      <FallingLetters />
-    </SceneCanvas>
+    <>
+      <SceneCanvas orbitControls={false}>
+        <FallingLetters />
+      </SceneCanvas>
+      <Hint text="scroll" dismissOn={['wheel', 'touchmove']} />
+    </>
   )
 }

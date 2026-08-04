@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useFrame } from '@react-three/fiber'
 import { BufferAttribute, BufferGeometry, DynamicDrawUsage, ShaderMaterial } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
+import Hint from '../../shared/Hint'
 import fontUrl from '../../assets/fonts/SpaceGrotesk-Bold.ttf?url'
 
 // GPU points-based particle system — a single THREE.Points draw call, not
@@ -544,8 +545,11 @@ function ParticleCloud() {
 
 export default function Type06() {
   return (
-    <SceneCanvas cameraPosition={[0, 0, 9]} fov={45} orbitControls={false}>
-      <ParticleCloud />
-    </SceneCanvas>
+    <>
+      <SceneCanvas cameraPosition={[0, 0, 9]} fov={45} orbitControls={false}>
+        <ParticleCloud />
+      </SceneCanvas>
+      <Hint text="type something" dismissOn={['keydown']} />
+    </>
   )
 }
