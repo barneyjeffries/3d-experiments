@@ -29,11 +29,24 @@ const SWIRL_HALF_WIDTH = 4.5
 const SWIRL_HALF_HEIGHT = 3
 const SWIRL_HALF_DEPTH = 1.4 // shallow — this is a "mostly flat" scene, not a volumetric one
 const SWIRL_SPEED = 0.55
-const CONTAIN_STRENGTH = 2.5 // soft pull back inward once a particle nears the swirl volume's edge
+// Containment used to be per-axis (clamp X once past its own bound, clamp Y
+// once past ITS own bound, etc.) — that's a rectangular box by construction,
+// which is exactly what read as boxy/cornered: particles slide along a flat
+// wall while only the crossed axis gets pulled back. Fixed by containing on
+// a single ellipsoid RADIUS instead (normalized by the three half-extents
+// above), so the pull-back has no flat faces or corners at all — see the
+// radial containment in the frame loop below.
+const SOFT_RADIUS_START = 0.65 // fraction of the ellipsoid where particles roam freely; beyond this, the pull-back ramps up
+const CONTAIN_STRENGTH = 1.4 // spring-like pull-back strength once past SOFT_RADIUS_START
 // Spatial/time frequencies for the curl field's underlying vector potential.
-// Distinct, non-matching values are what make the flow read as organic
-// rather than a single obvious rotation.
-const CURL_FREQ = [0.35, 0.42, 0.3, 0.38, 0.33, 0.4]
+// Raised from the original (0.3-0.42) — at that spatial scale, the cosine
+// terms don't complete even half a period across this volume, so the field
+// reads as one coherent "wind" rather than churning local eddies, and can
+// look like it's steadily driving particles toward one side. This is
+// mathematically still exactly divergence-free either way (curl of ANY
+// vector field is — verified analytically, not just asserted), but higher
+// spatial frequency keeps the circulation local instead of domain-spanning.
+const CURL_FREQ = [0.62, 0.74, 0.55, 0.68, 0.58, 0.7]
 const CURL_TIME_SPEED = [0.2, 0.24, 0.18, 0.22, 0.19, 0.26]
 // How strongly a particle's underlying swirl anchor is damped as it commits
 // to a letter (multiplies swirl-advection speed by (1 - formAmount)^this).
@@ -305,17 +318,22 @@ function ParticleCloud() {
       let vy = fb * Math.cos(sz * fb + t * wb) - fe * Math.cos(sx * fe + t * we)
       let vz = fd * Math.cos(sx * fd + t * wd) - fa * Math.cos(sy * fa + t * wa)
 
-      // soft containment: once past 80% of the swirl volume's half-extent,
-      // pull back inward proportionally, instead of a hard clamp.
-      const softX = SWIRL_HALF_WIDTH * 0.8
-      const softY = SWIRL_HALF_HEIGHT * 0.8
-      const softZ = SWIRL_HALF_DEPTH * 0.8
-      if (sx > softX) vx -= (sx - softX) * CONTAIN_STRENGTH
-      else if (sx < -softX) vx -= (sx + softX) * CONTAIN_STRENGTH
-      if (sy > softY) vy -= (sy - softY) * CONTAIN_STRENGTH
-      else if (sy < -softY) vy -= (sy + softY) * CONTAIN_STRENGTH
-      if (sz > softZ) vz -= (sz - softZ) * CONTAIN_STRENGTH
-      else if (sz < -softZ) vz -= (sz + softZ) * CONTAIN_STRENGTH
+      // Radial (ellipsoidal) soft containment — normalize position by the
+      // three half-extents so "1.0" is the nominal boundary regardless of
+      // aspect ratio, then pull back along the position vector itself once
+      // past SOFT_RADIUS_START. No per-axis clamp, so no flat wall to slide
+      // along and no corners where two walls meet — just a smooth, edgeless
+      // spring toward the centre that only engages near the outer boundary.
+      const nx = sx / SWIRL_HALF_WIDTH
+      const ny = sy / SWIRL_HALF_HEIGHT
+      const nz = sz / SWIRL_HALF_DEPTH
+      const r = Math.sqrt(nx * nx + ny * ny + nz * nz)
+      if (r > SOFT_RADIUS_START) {
+        const pull = (r - SOFT_RADIUS_START) * CONTAIN_STRENGTH
+        vx -= sx * pull
+        vy -= sy * pull
+        vz -= sz * pull
+      }
 
       swirlTargets[ix] = sx + vx * SWIRL_SPEED * swirlSuppression * delta
       swirlTargets[iy] = sy + vy * SWIRL_SPEED * swirlSuppression * delta
