@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useFrame, useThree } from '@react-three/fiber'
-import { BufferAttribute, BufferGeometry, ShaderMaterial, Vector2, Vector3, Vector4 } from 'three'
+import { BoxGeometry, BufferAttribute, BufferGeometry, EdgesGeometry, ShaderMaterial, Vector2, Vector3, Vector4 } from 'three'
 import SceneCanvas from '../../shared/SceneCanvas'
 import Hint from '../../shared/Hint'
 
 // Open-ocean surface (a rolling swell, not a breaking wave), rendered two ways
 // from the exact same wave function so they can be compared side by side:
 // a dense field of points, or rows of lines running across the view. Click /
-// tap the canvas to switch between them; the slider sets how rough the sea is.
+// tap the water to raise a cube through it (tap the cube to sink it); the
+// controls top right set how rough the sea is and switch points / lines.
 //
 // All motion happens in the vertex shader — the geometry is a flat, static
 // grid uploaded once, and the only per-frame CPU work is bumping a couple of
@@ -68,6 +69,58 @@ const TURBULENCE_SMOOTHING = 0.06 // per-frame ease toward the slider value, so 
 // sea down to a calmer pace than real-world metres-per-second would give.
 const TIME_SCALE = 0.55
 
+// CPU copy of the swell, for the cube to float on (see swellHeight). Mirrors
+// the vertex shader's height term exactly, with the per-wave constants
+// precomputed.
+const WAVE_TERMS = WAVES.map(([dx, dz, wavelength, calm, rough]) => {
+  const len = Math.hypot(dx, dz)
+  const k = (Math.PI * 2) / wavelength
+  return { dx: dx / len, dz: dz / len, k, speed: Math.sqrt(9.8 / k), calm, rough }
+})
+
+// The cube. A spring pulls it toward a floating height, so it pops up,
+// overshoots (its bottom briefly clears the water), splashes back, and
+// settles into bobbing on the swell.
+const CUBE_SIZE = 1.4
+const CUBE_FLOAT_OFFSET = 0.3 // centre height above the local swell when floating — about 70% rides above the water
+const CUBE_SUNK_Y = -4 // resting depth when sunk, well below the deepest trough
+const CUBE_RESPAWN_BELOW = -3 // sinking past this, it's out of sight and free to move to the next spot
+const SPRING_STIFFNESS = 4
+const SPRING_DAMPING = 1.8 // damping ratio ~0.45 with the stiffness above: a lively overshoot, a couple of bobs, then settled
+const TILT_FOLLOW = 0.8 // how far the cube tilts to match the swell's slope (1 = fully)
+const TILT_LERP = 0.08
+const SLOPE_SAMPLE = 0.6 // finite-difference half-step for the slope estimate
+const FIRST_RISE_DELAY = 1.2 // seconds after load before the cube first surfaces
+const FIRST_RISE_AT = [0, -2]
+const CUBE_FILL_COLOR = '#0b1117'
+const CUBE_EDGE_COLOR = '#e6f0f2'
+const CUBE_EDGE_FADE = [-2.5, 0.3] // edge opacity ramps in as the cube's top rises through this range (relative to the surface)
+const CLICK_BOUNDS = { x: 9, zNear: 5, zFar: -14 } // clicks are clamped here, keeping the cube well within frame
+
+// Water displaced by the cube, added on top of the swell in the shader.
+// Dome: water lifted over (and shouldered around) a rising cube, or dragged
+// down after a sinking one. Scaled by vertical speed, so a cube at rest
+// leaves the surface alone.
+const DOME_PEAK = 0.55
+const DOME_RADIUS = 1.5
+const DOME_DEPTH = 1.6 // how far below the surface the cube's top starts lifting the water
+const DOME_REFERENCE_SPEED = 3 // vertical speed at which the dome reaches full height
+// Ripples: a ring train sent out each time a face of the cube crosses the
+// surface fast enough — the breach, the splash back after the overshoot, and
+// the plunge when it sinks.
+const RIPPLE_COUNT = 4 // ring buffer; the oldest ring is recycled
+const RIPPLE_SPEED = 3.5
+// Kept well above the grid spacing (~0.25): shorter ripples are undersampled
+// by the points and break up into scattered specks rather than reading as rings.
+const RIPPLE_WAVELENGTH = 1.6
+const RIPPLE_WIDTH = 1.8 // width of the ring train's envelope
+const RIPPLE_SPREAD = 0.35 // amplitude falls off as 1 / (1 + spread * distance travelled), like a real ring losing height as it widens
+const RIPPLE_DECAY = 0.55 // amplitude falloff per second
+const RIPPLE_GAIN = 0.07 // ring amplitude per unit of crossing speed
+const RIPPLE_MAX = 0.3
+const RIPPLE_MIN_SPEED = 0.8 // slower crossings (gentle bobbing) don't ripple
+const RIPPLE_COOLDOWN = 0.25
+
 // Canvas cost — see SceneCanvas. The AO pass is off entirely: it has nothing
 // to shade, since these materials don't write depth. DPR is capped per mode:
 // points are fill-rate bound, so 1.5 cuts their pixel count ~44% on a 2x
@@ -93,6 +146,7 @@ const PARALLAX_LERP = 0.03
 // front — see OceanSurface — so a mode switch never stalls on a compile.
 const VERTEX_SHADER = /* glsl */ `
   #define WAVE_COUNT ${WAVES.length}
+  #define RIPPLE_COUNT ${RIPPLE_COUNT}
   uniform float uTime;
   uniform float uTurbulence;
   uniform vec4 uWaves[WAVE_COUNT]; // xy = direction, z = wavelength, w = calm steepness
@@ -103,6 +157,16 @@ const VERTEX_SHADER = /* glsl */ `
   uniform float uFadeFar;
   uniform float uPointSize;
   uniform float uPixelRatio;
+  uniform float uClock;
+  uniform vec2 uObjXZ;
+  uniform float uDome;
+  uniform float uDomeRadius;
+  uniform vec4 uRipples[RIPPLE_COUNT]; // xy = origin, z = start clock, w = strength (0 = unused)
+  uniform float uRippleSpeed;
+  uniform float uRippleK;
+  uniform float uRippleWidth;
+  uniform float uRippleDecay;
+  uniform float uRippleSpread;
   varying float vHeight;
   varying float vAlpha;
 
@@ -120,6 +184,21 @@ const VERTEX_SHADER = /* glsl */ `
       p.x += dir.x * a * c;
       p.z += dir.y * a * c;
       p.y += a * sin(f);
+    }
+
+    // Cube interaction (see Cube): a dome of displaced water around it, plus
+    // any ripple rings still spreading from earlier surface crossings.
+    float r = distance(xz, uObjXZ);
+    p.y += uDome * exp(-(r * r) / (uDomeRadius * uDomeRadius));
+    for (int i = 0; i < RIPPLE_COUNT; i++) {
+      vec4 ripple = uRipples[i];
+      float age = uClock - ripple.z;
+      if (ripple.w <= 0.0 || age < 0.0) continue;
+      float d = distance(xz, ripple.xy) - uRippleSpeed * age;
+      float travelled = uRippleSpeed * age;
+      float envelope = exp(-(d * d) / (uRippleWidth * uRippleWidth)) * exp(-age * uRippleDecay)
+        / (1.0 + uRippleSpread * travelled);
+      p.y += ripple.w * envelope * cos(d * uRippleK);
     }
     vHeight = p.y;
 
@@ -190,7 +269,25 @@ function buildGrid({ cols, rows }, lineIndex) {
   return geometry
 }
 
-function OceanSurface({ mode, turbulenceRef }) {
+function smoothstep(edge0, edge1, x) {
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)))
+  return t * t * (3 - 2 * t)
+}
+
+// Swell height at (x, z) — the shader's Gerstner sum, height term only. It
+// ignores the waves' horizontal shift, which is close enough to float on.
+function swellHeight(x, z, time, turbulence) {
+  let y = 0
+  for (const w of WAVE_TERMS) {
+    const steepness = w.calm + (w.rough - w.calm) * turbulence
+    y += (steepness / w.k) * Math.sin(w.k * (w.dx * x + w.dz * z - w.speed * time))
+  }
+  return y
+}
+
+// `water` holds the uniforms shared with Cube (turbulence, clock, dome,
+// ripples): Cube writes them, the surface's shader reads them.
+function OceanSurface({ mode, turbulenceRef, water }) {
   const { gl, scene, camera } = useThree()
   const pointsRef = useRef(null)
   const linesRef = useRef(null)
@@ -199,8 +296,8 @@ function OceanSurface({ mode, turbulenceRef }) {
   // below drives whichever mode is on screen (and a switch never jumps).
   const sharedUniforms = useMemo(
     () => ({
+      ...water,
       uTime: { value: 0 },
-      uTurbulence: { value: turbulenceRef.current },
       uWaves: { value: WAVES.map(([dx, dz, wavelength, calm]) => new Vector4(dx, dz, wavelength, calm)) },
       uRoughSteepness: { value: WAVES.map((w) => w[4]) },
       uHalfWidth: { value: SURFACE_HALF_WIDTH },
@@ -213,6 +310,12 @@ function OceanSurface({ mode, turbulenceRef }) {
       uCrestColor: { value: new Vector3(...CREST_COLOR) },
       uTroughAlpha: { value: TROUGH_ALPHA },
       uHeightRange: { value: HEIGHT_RANGE },
+      uDomeRadius: { value: DOME_RADIUS },
+      uRippleSpeed: { value: RIPPLE_SPEED },
+      uRippleK: { value: (Math.PI * 2) / RIPPLE_WAVELENGTH },
+      uRippleWidth: { value: RIPPLE_WIDTH },
+      uRippleDecay: { value: RIPPLE_DECAY },
+      uRippleSpread: { value: RIPPLE_SPREAD },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [gl]
@@ -257,6 +360,7 @@ function OceanSurface({ mode, turbulenceRef }) {
 
   useFrame((state) => {
     sharedUniforms.uTime.value = state.clock.elapsedTime * TIME_SCALE
+    sharedUniforms.uClock.value = state.clock.elapsedTime
     // Read live, not once at mount — the DPR changes when the mode does.
     sharedUniforms.uPixelRatio.value = state.gl.getPixelRatio()
     const turbulence = sharedUniforms.uTurbulence
@@ -303,25 +407,152 @@ function CameraRig() {
   return null
 }
 
-// Click / tap on the canvas (not the nav or slider) flips between render modes.
-function ModeToggle({ onToggle }) {
-  const { gl } = useThree()
+// The cube, plus an invisible plane at water level that catches clicks on the
+// water. Its motion is simulated here each frame and fed to the surface
+// shader through `water` (dome + ripple uniforms). A tap on the cube itself
+// stops propagation, so it never also counts as a tap on the water behind it.
+function Cube({ water }) {
+  const tiltRef = useRef(null)
+  const yawRef = useRef(null)
+  const edgeMaterialRef = useRef(null)
+  const boxGeometry = useMemo(() => new BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE), [])
+  const edgeGeometry = useMemo(() => new EdgesGeometry(boxGeometry), [boxGeometry])
 
-  useEffect(() => {
-    const el = gl.domElement
-    el.addEventListener('pointerdown', onToggle)
-    return () => el.removeEventListener('pointerdown', onToggle)
-  }, [gl, onToggle])
+  useEffect(
+    () => () => {
+      boxGeometry.dispose()
+      edgeGeometry.dispose()
+    },
+    [boxGeometry, edgeGeometry]
+  )
 
-  return null
+  // Mutable sim state, never rendered through React. `target` is where the
+  // spring pulls (floating or sunk); `pending` is a spot to surface at next,
+  // applied once the cube is deep enough to move there unseen.
+  const sim = useRef({
+    x: FIRST_RISE_AT[0],
+    z: FIRST_RISE_AT[1],
+    y: CUBE_SUNK_Y,
+    vy: 0,
+    target: 'down',
+    pending: { x: FIRST_RISE_AT[0], z: FIRST_RISE_AT[1] },
+    holdUntil: FIRST_RISE_DELAY,
+    tiltX: 0,
+    tiltZ: 0,
+    prevTop: null,
+    prevBottom: null,
+    lastRipple: -Infinity,
+    nextRipple: 0,
+  })
+
+  const raiseAt = (x, z) => {
+    const s = sim.current
+    s.pending = {
+      x: Math.min(CLICK_BOUNDS.x, Math.max(-CLICK_BOUNDS.x, x)),
+      z: Math.min(CLICK_BOUNDS.zNear, Math.max(CLICK_BOUNDS.zFar, z)),
+    }
+    s.target = 'down' // already sunk: resurfaces right away; floating: sinks first
+  }
+
+  const sink = () => {
+    sim.current.target = 'down'
+    sim.current.pending = null
+  }
+
+  useFrame((state, delta) => {
+    const s = sim.current
+    const clock = state.clock.elapsedTime
+    const time = clock * TIME_SCALE
+    const turbulence = water.uTurbulence.value
+    const dt = Math.min(delta, 1 / 30) // a dropped frame shouldn't kick the spring
+
+    if (s.pending && s.y < CUBE_RESPAWN_BELOW && clock >= s.holdUntil) {
+      s.x = s.pending.x
+      s.z = s.pending.z
+      s.pending = null
+      s.target = 'up'
+      s.prevTop = s.prevBottom = null
+      yawRef.current.rotation.y = Math.random() * Math.PI * 0.5
+    }
+
+    const surface = swellHeight(s.x, s.z, time, turbulence)
+    const targetY = s.target === 'up' ? surface + CUBE_FLOAT_OFFSET : CUBE_SUNK_Y
+    s.vy += (SPRING_STIFFNESS * (targetY - s.y) - SPRING_DAMPING * s.vy) * dt
+    s.y += s.vy * dt
+
+    // Face heights relative to the water directly around the cube.
+    const top = s.y + CUBE_SIZE / 2 - surface
+    const bottom = s.y - CUBE_SIZE / 2 - surface
+
+    // A face crossing the surface fast enough sends out a ripple ring.
+    if (s.prevTop !== null) {
+      const crossed = Math.sign(top) !== Math.sign(s.prevTop) || Math.sign(bottom) !== Math.sign(s.prevBottom)
+      const speed = Math.abs(s.vy)
+      if (crossed && speed > RIPPLE_MIN_SPEED && clock - s.lastRipple > RIPPLE_COOLDOWN) {
+        water.uRipples.value[s.nextRipple].set(s.x, s.z, clock, Math.min(speed * RIPPLE_GAIN, RIPPLE_MAX))
+        s.nextRipple = (s.nextRipple + 1) % RIPPLE_COUNT
+        s.lastRipple = clock
+      }
+    }
+    s.prevTop = top
+    s.prevBottom = bottom
+
+    // Dome: only while the cube is near/through the surface and its bottom is
+    // still in the water; its sign follows the direction of travel.
+    const proximity = smoothstep(-DOME_DEPTH, 0, top) * (1 - smoothstep(-0.2, 0.4, bottom))
+    const push = Math.min(1, Math.max(-0.6, s.vy / DOME_REFERENCE_SPEED))
+    water.uDome.value = DOME_PEAK * proximity * push
+    water.uObjXZ.value.set(s.x, s.z)
+
+    // Tilt with the swell's slope — the surface normal is (-dh/dx, 1, -dh/dz).
+    const e = SLOPE_SAMPLE
+    const dhdx = (swellHeight(s.x + e, s.z, time, turbulence) - swellHeight(s.x - e, s.z, time, turbulence)) / (2 * e)
+    const dhdz = (swellHeight(s.x, s.z + e, time, turbulence) - swellHeight(s.x, s.z - e, time, turbulence)) / (2 * e)
+    const floating = smoothstep(-DOME_DEPTH, 0, top)
+    s.tiltX += (-Math.atan(dhdz) * TILT_FOLLOW * floating - s.tiltX) * TILT_LERP
+    s.tiltZ += (Math.atan(dhdx) * TILT_FOLLOW * floating - s.tiltZ) * TILT_LERP
+
+    tiltRef.current.position.set(s.x, s.y, s.z)
+    tiltRef.current.rotation.set(s.tiltX, 0, s.tiltZ)
+    edgeMaterialRef.current.opacity = smoothstep(CUBE_EDGE_FADE[0], CUBE_EDGE_FADE[1], top)
+  })
+
+  return (
+    <>
+      <mesh
+        rotation-x={-Math.PI / 2}
+        onPointerDown={(event) => raiseAt(event.point.x, event.point.z)}
+      >
+        <planeGeometry args={[200, 200]} />
+        <meshBasicMaterial visible={false} />
+      </mesh>
+      <group ref={tiltRef} position={[FIRST_RISE_AT[0], CUBE_SUNK_Y, FIRST_RISE_AT[1]]}>
+        <group ref={yawRef}>
+          <mesh
+            geometry={boxGeometry}
+            onPointerDown={(event) => {
+              event.stopPropagation()
+              sink()
+            }}
+          >
+            <meshStandardMaterial color={CUBE_FILL_COLOR} roughness={0.6} metalness={0} />
+          </mesh>
+          <lineSegments geometry={edgeGeometry}>
+            <lineBasicMaterial ref={edgeMaterialRef} color={CUBE_EDGE_COLOR} transparent opacity={0} />
+          </lineSegments>
+        </group>
+      </group>
+    </>
+  )
 }
 
-// HTML overlay (like Nav/Hint), styled to match Hint's muted monospace. Writes
-// straight into a ref rather than React state, so dragging never re-renders
-// the canvas — the frame loop picks the new value up and eases toward it.
-function TurbulenceSlider({ turbulenceRef }) {
+// HTML overlay (like Nav/Hint), styled to match Hint's muted monospace. The
+// slider writes straight into a ref rather than React state, so dragging never
+// re-renders the canvas — the frame loop picks the new value up and eases
+// toward it.
+function Controls({ turbulenceRef, mode, onToggleMode }) {
   return (
-    <label
+    <div
       style={{
         position: 'fixed',
         // Tucked under the nav's links rather than at the bottom, where it
@@ -330,16 +561,18 @@ function TurbulenceSlider({ turbulenceRef }) {
         right: '1.5rem',
         zIndex: 10,
         display: 'flex',
-        alignItems: 'center',
-        gap: '0.75rem',
+        flexDirection: 'column',
+        alignItems: 'flex-end',
+        gap: '0.6rem',
         fontFamily: 'ui-monospace, "SF Mono", Menlo, Consolas, monospace',
         fontSize: '0.75rem',
         letterSpacing: '0.04em',
         color: 'rgba(244, 244, 240, 0.55)',
       }}
     >
-      turbulence
-      <input
+      <label style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+        turbulence
+        <input
         type="range"
         min={0}
         max={1}
@@ -347,8 +580,14 @@ function TurbulenceSlider({ turbulenceRef }) {
         defaultValue={turbulenceRef.current}
         onInput={(event) => (turbulenceRef.current = Number(event.currentTarget.value))}
         style={{ width: '8rem', accentColor: '#e6f0f2' }}
-      />
-    </label>
+        />
+      </label>
+      <button type="button" onClick={onToggleMode} style={{ all: 'unset', cursor: 'pointer' }}>
+        <span style={{ color: mode === 'points' ? '#f4f4f0' : undefined }}>points</span>
+        {' / '}
+        <span style={{ color: mode === 'lines' ? '#f4f4f0' : undefined }}>lines</span>
+      </button>
+    </div>
   )
 }
 
@@ -356,6 +595,16 @@ export default function Type06() {
   const [mode, setMode] = useState('points')
   const toggleMode = useMemo(() => () => setMode((m) => (m === 'points' ? 'lines' : 'points')), [])
   const turbulenceRef = useRef(TURBULENCE_DEFAULT)
+  const water = useMemo(
+    () => ({
+      uTurbulence: { value: TURBULENCE_DEFAULT },
+      uClock: { value: 0 },
+      uObjXZ: { value: new Vector2() },
+      uDome: { value: 0 },
+      uRipples: { value: Array.from({ length: RIPPLE_COUNT }, () => new Vector4()) },
+    }),
+    []
+  )
 
   return (
     <>
@@ -367,12 +616,12 @@ export default function Type06() {
         dpr={DPR_BY_MODE[mode]}
         ambientOcclusion={false}
       >
-        <OceanSurface mode={mode} turbulenceRef={turbulenceRef} />
+        <OceanSurface mode={mode} turbulenceRef={turbulenceRef} water={water} />
+        <Cube water={water} />
         <CameraRig />
-        <ModeToggle onToggle={toggleMode} />
       </SceneCanvas>
-      <TurbulenceSlider turbulenceRef={turbulenceRef} />
-      <Hint text="click to switch points / lines" dismissOn={['pointerdown']} dark />
+      <Controls turbulenceRef={turbulenceRef} mode={mode} onToggleMode={toggleMode} />
+      <Hint text="click the water" dismissOn={['pointerdown']} dark />
     </>
   )
 }
