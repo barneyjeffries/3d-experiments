@@ -145,6 +145,11 @@ const SELECTED_CENTER_Y = CARD_HEIGHT / 2 + 0.5 // bottom edge lifted clear of t
 const SELECTED_BOB = 0.05
 const SPRING_STIFFNESS = 4
 const SPRING_DAMPING = 1.8 // damping ratio ~0.45, as Type06's cube
+// The select rise runs at twice the frequency (4x stiffness, 2x damping —
+// same ~0.45 ratio, so the same bounce, just quicker), keeping pace with the
+// camera's glide in.
+const SELECTED_SPRING_STIFFNESS = 16
+const SELECTED_SPRING_DAMPING = 3.6
 const TILT_FOLLOW = 0.6
 const TILT_LERP = 0.08
 const YAW_LERP = 0.06
@@ -183,7 +188,7 @@ const BOB_AMPLITUDE = 0.12
 const BOB_SPEED = 0.45
 const PARALLAX_X = 1.2
 const PARALLAX_Y = 0.5
-const CAMERA_EASE = 1.6 // exponential ease rate, per second
+const CAMERA_EASE = 3.2 // exponential ease rate, per second — higher is snappier
 const FOCUS_DISTANCE = 6.5
 const FOCUS_DISTANCE_PORTRAIT = 9.5
 const FOCUS_HEIGHT = 0.3
@@ -526,7 +531,10 @@ function Card({ project, index, state: cardState, water, emitRipple, cardStates,
     else if (mode === 'hover') targetY = surface + TOP_HOVER - CARD_HEIGHT / 2
     else if (mode === 'hidden') targetY = surface + TOP_HIDDEN - CARD_HEIGHT / 2
     else targetY = surface + TOP_IDLE - CARD_HEIGHT / 2
-    s.vy += (SPRING_STIFFNESS * (targetY - s.y) - SPRING_DAMPING * s.vy) * dt
+    const selected = mode === 'selected'
+    const stiffness = selected ? SELECTED_SPRING_STIFFNESS : SPRING_STIFFNESS
+    const damping = selected ? SELECTED_SPRING_DAMPING : SPRING_DAMPING
+    s.vy += (stiffness * (targetY - s.y) - damping * s.vy) * dt
     s.y += s.vy * dt
 
     const top = s.y + CARD_HEIGHT / 2 - surface
@@ -686,7 +694,7 @@ const STYLES = `
     opacity: 1;
     pointer-events: auto;
     transform: translate(0, -50%);
-    transition-delay: 0.35s; /* let the camera start moving first */
+    transition-delay: 0.18s; /* let the camera start moving first */
   }
   .t07-detail h2 { font-size: 2rem; font-weight: 600; margin: 0.6rem 0 0.4rem; }
   .t07-detail .t07-meta { display: block; margin-bottom: 1.2rem; }
