@@ -8,6 +8,7 @@ const EXPERIMENTS = [
   { path: '/type-05', label: 'Type 05', description: 'GPU particle cloud that forms typed letters' },
   { path: '/type-06', label: 'Type 06', description: 'Ocean surface swell — points or lines' },
   { path: '/type-07', label: 'Type 07', description: 'Portfolio prototype — projects surface from the sea' },
+  { path: '/type-08', label: 'Type 08', description: 'Portfolio prototype — scroll projects up through the water' },
 ]
 
 export default function Home() {
