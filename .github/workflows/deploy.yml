@@ -3,6 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  # Manual "Run workflow" button, for redeploying when a push event gets missed.
+  workflow_dispatch:
 
 permissions:
   contents: read
