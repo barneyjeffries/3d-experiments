@@ -9,6 +9,7 @@ const EXPERIMENTS = [
   { path: '/type-06', label: 'Type 06', description: 'Ocean surface swell — points or lines' },
   { path: '/type-07', label: 'Type 07', description: 'Portfolio prototype — projects surface from the sea' },
   { path: '/type-08', label: 'Type 08', description: 'Portfolio prototype — scroll projects up through the water' },
+  { path: '/type-09', label: 'Type 09', description: 'Portfolio prototype — open a project, the sea pours aside' },
 ]
 
 export default function Home() {
